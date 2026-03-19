@@ -290,6 +290,22 @@ static int run_cmd(const char *prog, char *const argv[]) {
     return (status >> 8) & 0xff; /* exit code */
 }
 
+/* Run an external command with stderr suppressed (for expected-failure checks) */
+static int run_cmd_quiet(const char *prog, char *const argv[]) {
+    lc_sysret pid = lc_kernel_fork();
+    if (pid == 0) {
+        /* redirect stderr to /dev/null */
+        lc_sysret devnull = lc_kernel_open_file("/dev/null", O_WRONLY, 0);
+        if (devnull >= 0) lc_kernel_duplicate_fd((int32_t)devnull, STDERR, 0);
+        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+        lc_kernel_execute(prog, argv, envp);
+        lc_kernel_exit(127);
+    }
+    int32_t status;
+    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+    return (status >> 8) & 0xff;
+}
+
 /* Validate container name: [a-zA-Z0-9_-], max 12 chars */
 static void validate_name(const char *name) {
     if (!name || !name[0]) die("Error: container name required");
@@ -781,7 +797,7 @@ static void mask_proc_paths(void) {
 
 /* Check if an iptables rule exists (-C), return 0 if it does */
 static int iptables_check(char *const argv[]) {
-    return run_cmd("/usr/sbin/iptables", argv);
+    return run_cmd_quiet("/usr/sbin/iptables", argv);
 }
 
 /* Add an iptables rule only if it doesn't already exist */
@@ -839,7 +855,7 @@ static void cmd_setup(void) {
     /* create bridge if it doesn't exist */
     {
         char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
-        if (run_cmd("/sbin/ip", show) != 0) {
+        if (run_cmd_quiet("/sbin/ip", show) != 0) {
             print_str(STDOUT, "Creating bridge ");
             print_str(STDOUT, cfg_global.bridge);
             print_str(STDOUT, "...\n");
@@ -1091,6 +1107,7 @@ static void cmd_create(int argc, char **argv) {
 
 struct child_args {
     int          sync_pipe_rd;
+    int          sync_pipe_wr;
     const char  *name;
     const char  *root;
     int          userns;
@@ -1104,6 +1121,13 @@ struct child_args {
  */
 static int container_child(void *arg) {
     struct child_args *ca = (struct child_args *)arg;
+
+    /* close the write end so we only read */
+    lc_kernel_close_file(ca->sync_pipe_wr);
+
+    /* make all mounts private — prevents host mount events (including
+     * the host's /proc) from propagating into the container */
+    lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     /* wait for parent to set up uid/gid maps */
     char sync_byte;
@@ -1206,9 +1230,28 @@ static int container_child(void *arg) {
     lc_kernel_unlinkat(AT_FDCWD, "/.old_root", AT_REMOVEDIR);
     lc_kernel_chdir("/");
 
-    /* mount proc, sys */
-    lc_kernel_mount("proc", "/proc", "proc", 0, NULL);
-    lc_kernel_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    /* mount proc, sys — use fork+exec of mount(8) rather than raw syscall,
+     * because busybox mount may handle proc namespace association differently */
+    {
+        lc_sysret p = lc_kernel_fork();
+        if (p == 0) {
+            char *a[] = { "mount", "-t", "proc", "proc", "/proc", NULL };
+            char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+            lc_kernel_execute("/bin/mount", a, e);
+            lc_kernel_exit(1);
+        }
+        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
+    }
+    {
+        lc_sysret p = lc_kernel_fork();
+        if (p == 0) {
+            char *a[] = { "mount", "-t", "sysfs", "sysfs", "/sys", "-o", "ro", NULL };
+            char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+            lc_kernel_execute("/bin/mount", a, e);
+            lc_kernel_exit(1);
+        }
+        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
+    }
 
     /* devpts and shm inside container */
     lc_kernel_mount("devpts", "/dev/pts", "devpts",
@@ -1319,9 +1362,13 @@ static void cmd_start(int argc, char **argv) {
         str_append(veth_cont, p2, name, sizeof(veth_cont));
     }
 
-    /* clean up stale veth */
-    { char *a[] = { "ip", "link", "delete", veth_host, NULL };
-      run_cmd("/sbin/ip", a); }
+    /* clean up stale veth if it exists */
+    { char *show[] = { "ip", "link", "show", veth_host, NULL };
+      if (run_cmd_quiet("/sbin/ip", show) == 0) {
+          char *del[] = { "ip", "link", "delete", veth_host, NULL };
+          run_cmd("/sbin/ip", del);
+      }
+    }
 
     /* create veth pair */
     { char *a[] = { "ip", "link", "add", veth_cont, "type", "veth", "peer", "name", veth_host, NULL };
@@ -1350,6 +1397,7 @@ static void cmd_start(int argc, char **argv) {
     /* prepare child args */
     struct child_args ca = {
         .sync_pipe_rd = sync_pipe[0],
+        .sync_pipe_wr = sync_pipe[1],
         .name = name,
         .root = root,
         .userns = userns,
@@ -1357,17 +1405,11 @@ static void cmd_start(int argc, char **argv) {
         .read_only = read_only,
     };
 
-    /* clone! */
-    lc_sysret child_pid = lc_syscall5(SYS_clone, clone_flags,
-                                       (int64_t)stack_top, 0, 0, 0);
+    /* clone — lc_kernel_clone places fn+arg on the child's stack before
+     * the syscall, so the child never touches our stack frame */
+    lc_sysret child_pid = lc_kernel_clone(clone_flags, stack_top,
+                                           container_child, &ca);
     if (child_pid < 0) die("Error: clone failed");
-
-    if (child_pid == 0) {
-        /* we're in the child */
-        lc_kernel_close_file(sync_pipe[1]);
-        container_child(&ca);
-        lc_kernel_exit(1);
-    }
 
     /* parent continues */
     lc_kernel_close_file(sync_pipe[0]);
@@ -1402,29 +1444,14 @@ static void cmd_start(int argc, char **argv) {
         write_file(proc_path, map_buf);
     }
 
-    /* unblock the child */
-    lc_kernel_write_bytes(sync_pipe[1], "x", 1);
-    lc_kernel_close_file(sync_pipe[1]);
-
-    /* wait a moment for child to set up, then check it's alive */
-    lc_timespec ts = { .seconds = 0, .nanoseconds = 500000000 }; /* 500ms */
-    lc_kernel_sleep(&ts);
-
-    if (lc_kernel_send_signal((int32_t)child_pid, 0) < 0) {
-        print_str(STDERR, "Error: container process died during startup\n");
-        char *a[] = { "ip", "link", "delete", veth_host, NULL };
-        run_cmd("/sbin/ip", a);
-        lc_kernel_exit(1);
-    }
+    /*
+     * Set up cgroup, networking, and OOM score BEFORE unblocking the child.
+     * While the child is blocked on the sync pipe it is guaranteed alive,
+     * so all operations that reference its PID or network namespace succeed.
+     */
 
     /* set up cgroup */
     cgroup_create(name, (int)child_pid);
-
-    /* write PID file */
-    char pid_path[MAX_PATH], pidbuf[16];
-    container_pid_path(pid_path, name);
-    fmt_int(pidbuf, (int)child_pid);
-    write_file(pid_path, pidbuf);
 
     /* move veth into container network namespace */
     {
@@ -1459,6 +1486,28 @@ static void cmd_start(int argc, char **argv) {
         write_file(oom_path, oom_buf);
     }
 
+    /* unblock the child — it can now set up mounts, pivot_root, and exec init */
+    lc_kernel_write_bytes(sync_pipe[1], "x", 1);
+    lc_kernel_close_file(sync_pipe[1]);
+
+    /* wait for child to finish setup, then verify it's alive */
+    lc_timespec ts = { .seconds = 0, .nanoseconds = 500000000 }; /* 500ms */
+    lc_kernel_sleep(&ts);
+
+    if (lc_kernel_send_signal((int32_t)child_pid, 0) < 0) {
+        print_str(STDERR, "Error: container process died during startup\n");
+        char *a[] = { "ip", "link", "delete", veth_host, NULL };
+        run_cmd("/sbin/ip", a);
+        cgroup_destroy(name);
+        lc_kernel_exit(1);
+    }
+
+    /* write PID file only after confirming the child is alive */
+    char pid_path[MAX_PATH], pidbuf[16];
+    container_pid_path(pid_path, name);
+    fmt_int(pidbuf, (int)child_pid);
+    write_file(pid_path, pidbuf);
+
     /* set up --link rules: allow traffic between this container and linked ones */
     {
         char conf_buf2[2048];
@@ -1485,16 +1534,24 @@ static void cmd_start(int argc, char **argv) {
                             if (link_ip[j] == '\n') { link_ip[j] = '\0'; break; }
 
                         /* insert ACCEPT rules for both directions (before the DROP) */
+                        char *c1[] = { "iptables", "-C", "FORWARD",
+                                       "-s", ip, "-d", link_ip,
+                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                       "-j", "ACCEPT", NULL };
                         char *a1[] = { "iptables", "-I", "FORWARD",
                                        "-s", ip, "-d", link_ip,
                                        "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                        "-j", "ACCEPT", NULL };
-                        run_cmd("/usr/sbin/iptables", a1);
+                        iptables_idempotent(c1, a1);
+                        char *c2[] = { "iptables", "-C", "FORWARD",
+                                       "-s", link_ip, "-d", ip,
+                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                       "-j", "ACCEPT", NULL };
                         char *a2[] = { "iptables", "-I", "FORWARD",
                                        "-s", link_ip, "-d", ip,
                                        "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                        "-j", "ACCEPT", NULL };
-                        run_cmd("/usr/sbin/iptables", a2);
+                        iptables_idempotent(c2, a2);
                     }
                 }
                 while (*p && *p != '\n') p++;
@@ -1533,22 +1590,16 @@ static void cmd_stop(int argc, char **argv) {
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
 
-    /* SIGTERM */
-    lc_kernel_send_signal(pid, SIGTERM);
+    /* PID 1 in a PID namespace only receives signals it has registered
+     * handlers for.  sleep(1) doesn't handle SIGTERM, so send SIGKILL
+     * directly — killing PID 1 destroys the entire PID namespace. */
+    lc_kernel_send_signal(pid, SIGKILL);
 
-    /* wait up to 10 seconds */
-    for (int i = 0; i < 20; i++) {
-        lc_timespec ts = { .seconds = 0, .nanoseconds = 500000000 };
+    /* wait for process to exit */
+    for (int i = 0; i < 10; i++) {
+        lc_timespec ts = { .seconds = 0, .nanoseconds = 200000000 };
         lc_kernel_sleep(&ts);
         if (lc_kernel_send_signal(pid, 0) < 0) break;
-    }
-
-    /* force kill if still alive */
-    if (lc_kernel_send_signal(pid, 0) >= 0) {
-        print_str(STDOUT,"Force killing container...\n");
-        lc_kernel_send_signal(pid, SIGKILL);
-        lc_timespec ts = { .seconds = 0, .nanoseconds = 500000000 };
-        lc_kernel_sleep(&ts);
     }
 
     /* wait for child to reap */
@@ -1593,16 +1644,26 @@ static void cmd_stop(int argc, char **argv) {
                         if (read_file(link_ip_path, link_ip, sizeof(link_ip)) > 0) {
                             for (int k = 0; link_ip[k]; k++)
                                 if (link_ip[k] == '\n') { link_ip[k] = '\0'; break; }
+                            char *c1[] = { "iptables", "-C", "FORWARD",
+                                           "-s", ip_buf, "-d", link_ip,
+                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                           "-j", "ACCEPT", NULL };
                             char *r1[] = { "iptables", "-D", "FORWARD",
                                            "-s", ip_buf, "-d", link_ip,
                                            "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                            "-j", "ACCEPT", NULL };
-                            run_cmd("/usr/sbin/iptables", r1);
+                            if (iptables_check(c1) == 0)
+                                run_cmd("/usr/sbin/iptables", r1);
+                            char *c2[] = { "iptables", "-C", "FORWARD",
+                                           "-s", link_ip, "-d", ip_buf,
+                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                           "-j", "ACCEPT", NULL };
                             char *r2[] = { "iptables", "-D", "FORWARD",
                                            "-s", link_ip, "-d", ip_buf,
                                            "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                            "-j", "ACCEPT", NULL };
-                            run_cmd("/usr/sbin/iptables", r2);
+                            if (iptables_check(c2) == 0)
+                                run_cmd("/usr/sbin/iptables", r2);
                         }
                     }
                     while (*p && *p != '\n') p++;
@@ -1612,13 +1673,16 @@ static void cmd_stop(int argc, char **argv) {
         }
     }
 
-    /* clean up veth */
+    /* clean up veth if it exists */
     {
         char veth_host[16];
         size_t p = str_copy(veth_host, "vb-", sizeof(veth_host));
         str_append(veth_host, p, name, sizeof(veth_host));
-        char *a[] = { "ip", "link", "delete", veth_host, NULL };
-        run_cmd("/sbin/ip", a);
+        char *show[] = { "ip", "link", "show", veth_host, NULL };
+        if (run_cmd_quiet("/sbin/ip", show) == 0) {
+            char *del[] = { "ip", "link", "delete", veth_host, NULL };
+            run_cmd("/sbin/ip", del);
+        }
     }
 
     /* remove PID file */
