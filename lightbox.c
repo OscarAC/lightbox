@@ -21,6 +21,8 @@
 #include <lightc/format.h>
 #include <lightc/io.h>
 
+#include "lightbox.h"
+
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
@@ -28,6 +30,9 @@
 #define MAX_LINKS        8
 #define NAME_MAX_LEN     12
 #define CONF_BUF_SIZE    2048
+#define USERNS_RANGE_SIZE 65536
+#define USERNS_MIN_START 100000
+#define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
 /* ─── Configurable defaults ─────────────────────────────────────────────── */
 
@@ -35,26 +40,13 @@
 
 /* All runtime-configurable values live here. Initialized to built-in defaults,
  * then overridden by lightbox.conf if present. */
-static struct {
-    char lightbox_dir[MAX_PATH];
-    char rootfs[MAX_PATH];
-    char container_dir[MAX_PATH];
-    char run_dir[MAX_PATH];
-    char cgroup_root[MAX_PATH];
-    char cgroup_base[MAX_PATH];
-    char bridge[32];
-    char subnet[20];
-    char gw[16];
-    char default_mem[16];
-    char default_pids[8];
-    char default_cpu[4];
-    int  default_oom;
-} cfg_global;
+global_config cfg_global;
 
 /* cfg_global_init() and cfg_global_load() defined after utility functions */
 
 /* prctl constants */
 #define PR_SET_NO_NEW_PRIVS  38
+#define PR_SET_KEEPCAPS      8
 #define PR_CAPBSET_READ      23
 #define PR_CAPBSET_DROP      24
 #define PR_SET_SECCOMP       22
@@ -63,6 +55,10 @@ static struct {
 #define SECCOMP_MODE_FILTER    2
 #define SECCOMP_RET_ALLOW      0x7fff0000
 #define SECCOMP_RET_ERRNO      0x00050000
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+
+/* seccomp/audit constants */
+#define AUDIT_ARCH_X86_64      0xc000003eU
 
 /* BPF instruction macros */
 #define BPF_LD   0x00
@@ -99,6 +95,19 @@ static struct {
 #define CLONE_VM        0x00000100
 #define CLONE_VFORK     0x00004000
 
+/* raw syscall numbers used by lightbox directly */
+#define SYS_fchdir      81
+#define SYS_chroot      161
+#if defined(__x86_64__)
+#define SYS_capget      125
+#define SYS_capset      126
+#elif defined(__aarch64__)
+#define SYS_capget      90
+#define SYS_capset      91
+#else
+#error "Unsupported architecture"
+#endif
+
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
 struct sock_filter {
@@ -113,8 +122,20 @@ struct sock_fprog {
     struct sock_filter  *filter;
 };
 
+struct user_cap_header {
+    uint32_t version;
+    int32_t pid;
+};
+
+struct user_cap_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
+
 /* seccomp_data layout — offset of 'nr' is 0 */
 #define SECCOMP_DATA_NR_OFFSET 0
+#define SECCOMP_DATA_ARCH_OFFSET 4
 
 typedef struct {
     char name[NAME_MAX_LEN + 1];
@@ -137,217 +158,131 @@ typedef struct {
 
 /* ─── Utility functions ─────────────────────────────────────────────────── */
 
-/* Look up an environment variable by name. Returns value or NULL. */
-static const char *env_get(char **envp, const char *name) {
-    if (!envp) return NULL;
-    size_t nlen = lc_string_length(name);
-    for (int i = 0; envp[i]; i++) {
-        if (lc_string_starts_with(envp[i], lc_string_length(envp[i]), name, nlen)
-            && envp[i][nlen] == '=')
-            return envp[i] + nlen + 1;
+static bool parse_u32_strict(const char *s, uint32_t *out) {
+    uint32_t val = 0;
+    if (!s || !s[0]) return false;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9') return false;
+        val = val * 10u + (uint32_t)(c - '0');
     }
-    return NULL;
+    *out = val;
+    return true;
 }
 
-/* Print a null-terminated string (convenience wrapper) */
-static void print_str(int32_t fd, const char *s) {
-    lc_print_string(fd, s, lc_string_length(s));
-}
+static bool parse_ipv4(const char *s, uint8_t out[4]) {
+    uint32_t cur = 0;
+    int octet = 0;
+    bool have_digit = false;
+    if (!s || !s[0]) return false;
 
-static void die(const char *msg) {
-    print_str(STDERR, msg);
-    lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
-}
-
-static void die2(const char *prefix, const char *detail) {
-    print_str(STDERR, prefix);
-    print_str(STDERR, detail);
-    lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
-}
-
-static bool streq(const char *a, const char *b) {
-    size_t la = lc_string_length(a);
-    size_t lb = lc_string_length(b);
-    if (la != lb) return false;
-    return lc_string_equal(a, la, b, lb);
-}
-
-static size_t str_copy(char *dst, const char *src, size_t max) {
-    size_t len = lc_string_length(src);
-    if (len >= max) len = max - 1;
-    lc_bytes_copy(dst, src, len);
-    dst[len] = '\0';
-    return len;
-}
-
-static size_t str_append(char *dst, size_t pos, const char *src, size_t max) {
-    size_t len = lc_string_length(src);
-    if (pos + len >= max) len = max - pos - 1;
-    lc_bytes_copy(dst + pos, src, len);
-    dst[pos + len] = '\0';
-    return pos + len;
-}
-
-static void path_join(char *buf, size_t bufsz, const char *a, const char *b) {
-    size_t pos = str_copy(buf, a, bufsz);
-    if (pos > 0 && buf[pos - 1] != '/') {
-        pos = str_append(buf, pos, "/", bufsz);
+    for (size_t i = 0;; i++) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') {
+            have_digit = true;
+            cur = cur * 10u + (uint32_t)(c - '0');
+            if (cur > 255u) return false;
+        } else if (c == '.' || c == '\0') {
+            if (!have_digit || octet >= 4) return false;
+            out[octet++] = (uint8_t)cur;
+            cur = 0;
+            have_digit = false;
+            if (c == '\0') break;
+        } else {
+            return false;
+        }
     }
-    /* skip leading slash on b */
-    if (b[0] == '/') b++;
-    str_append(buf, pos, b, bufsz);
+
+    return octet == 4;
 }
 
-/* Parse a decimal integer from a string */
-static int parse_int(const char *s) {
-    int neg = 0, val = 0;
-    if (*s == '-') { neg = 1; s++; }
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (*s - '0');
-        s++;
+static uint32_t ipv4_to_u32(const uint8_t ip[4]) {
+    return ((uint32_t)ip[0] << 24) |
+           ((uint32_t)ip[1] << 16) |
+           ((uint32_t)ip[2] << 8) |
+           (uint32_t)ip[3];
+}
+
+static bool parse_cidr_ipv4(const char *cidr, uint8_t net[4], uint32_t *prefix) {
+    const char *slash = NULL;
+    for (const char *p = cidr; *p; p++) {
+        if (*p == '/') { slash = p; break; }
     }
-    return neg ? -val : val;
+    if (!slash) return false;
+
+    char ip_part[20];
+    size_t ip_len = (size_t)(slash - cidr);
+    if (ip_len == 0 || ip_len >= sizeof(ip_part)) return false;
+    lc_bytes_copy(ip_part, cidr, ip_len);
+    ip_part[ip_len] = '\0';
+
+    if (!parse_ipv4(ip_part, net)) return false;
+    if (!parse_u32_strict(slash + 1, prefix)) return false;
+    return *prefix <= 32u;
 }
 
-/* Format an integer into a buffer, return length */
-static int fmt_int(char *buf, int val) {
-    if (val == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
-    int neg = 0, len = 0;
-    char tmp[16];
-    if (val < 0) { neg = 1; val = -val; }
-    while (val > 0) { tmp[len++] = '0' + (val % 10); val /= 10; }
-    int pos = 0;
-    if (neg) buf[pos++] = '-';
-    for (int i = len - 1; i >= 0; i--) buf[pos++] = tmp[i];
-    buf[pos] = '\0';
-    return pos;
+static void validate_ipv4_address(const char *ip) {
+    uint8_t tmp[4];
+    if (!parse_ipv4(ip, tmp))
+        die2("Error: invalid IPv4 address: ", ip);
 }
 
-/* Write a string to a file, returns 0 on success */
-static int write_file(const char *path, const char *data) {
-    lc_sysret fd = lc_kernel_open_file(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    size_t len = lc_string_length(data);
-    lc_kernel_write_bytes((int32_t)fd, data, len);
-    lc_kernel_close_file((int32_t)fd);
-    return 0;
+static void validate_ip_in_subnet(const char *ip, const char *cidr) {
+    uint8_t ip_octets[4], net_octets[4];
+    uint32_t prefix = 0;
+    if (!parse_ipv4(ip, ip_octets))
+        die2("Error: invalid IPv4 address: ", ip);
+    if (!parse_cidr_ipv4(cidr, net_octets, &prefix))
+        die2("Error: invalid subnet in config: ", cidr);
+
+    uint32_t mask = (prefix == 0) ? 0u : (0xffffffffu << (32u - prefix));
+    if ((ipv4_to_u32(ip_octets) & mask) != (ipv4_to_u32(net_octets) & mask))
+        die2("Error: IP is outside configured subnet: ", ip);
 }
 
-/* Read file contents into buf, null-terminate. Returns bytes read or -1. */
-static int read_file(const char *path, char *buf, size_t bufsz) {
-    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);
-    if (fd < 0) return -1;
-    lc_sysret n = lc_kernel_read_bytes((int32_t)fd, buf, bufsz - 1);
-    lc_kernel_close_file((int32_t)fd);
-    if (n < 0) return -1;
-    buf[n] = '\0';
-    return (int)n;
+static void validate_positive_integer_option(const char *label, const char *value) {
+    uint32_t parsed;
+    if (!parse_u32_strict(value, &parsed) || parsed == 0)
+        die2(label, value);
 }
 
-/* Check if a path exists (file or directory) */
-static bool path_exists(const char *path) {
-    return lc_kernel_faccessat2(AT_FDCWD, path, F_OK, 0) == 0;
+static void validate_oom_score(int oom_score) {
+    if (oom_score < -1000 || oom_score > 1000)
+        die("Error: oom-score must be between -1000 and 1000");
 }
 
-/* Recursively remove a directory tree (fork+exec rm -rf) */
-static void rm_rf(const char *path) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        char *argv[] = { "rm", "-rf", (char *)path, NULL };
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute("/bin/rm", argv, envp);
-        lc_kernel_exit(1);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-}
-
-/* Copy directory tree (fork+exec cp -a) */
-static void cp_a(const char *src, const char *dst) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        char *argv[] = { "cp", "-a", (char *)src, (char *)dst, NULL };
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute("/bin/cp", argv, envp);
-        lc_kernel_exit(1);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-}
-
-/* Run an external command (fork+exec), wait for completion */
-static int run_cmd(const char *prog, char *const argv[]) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(prog, argv, envp);
-        lc_kernel_exit(127);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    return (status >> 8) & 0xff; /* exit code */
-}
-
-/* Run an external command with stderr suppressed (for expected-failure checks) */
-static int run_cmd_quiet(const char *prog, char *const argv[]) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        /* redirect stderr to /dev/null */
-        lc_sysret devnull = lc_kernel_open_file("/dev/null", O_WRONLY, 0);
-        if (devnull >= 0) lc_kernel_duplicate_fd((int32_t)devnull, STDERR, 0);
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(prog, argv, envp);
-        lc_kernel_exit(127);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    return (status >> 8) & 0xff;
-}
-
-/* Mount via fork+exec of /bin/mount.
- * Works around EFAULT from raw mount syscall in clone'd children. */
-static int do_mount(const char *source, const char *target,
-                    const char *fstype, uint64_t flags, const char *data) {
-    char *argv[16];
-    int ai = 0;
-    argv[ai++] = "mount";
-    if ((flags & MS_PRIVATE) && (flags & MS_REC)) {
-        argv[ai++] = "--make-rprivate"; argv[ai++] = (char *)target;
-        argv[ai] = NULL; return run_cmd("/bin/mount", argv);
-    }
-    if ((flags & MS_REMOUNT) && (flags & MS_BIND)) {
-        argv[ai++] = "-o";
-        argv[ai++] = (flags & MS_RDONLY) ? "remount,bind,ro" : "remount,bind";
-        argv[ai++] = (char *)target; argv[ai] = NULL;
-        return run_cmd("/bin/mount", argv);
-    }
-    if ((flags & MS_BIND) && (flags & MS_REC)) {
-        argv[ai++] = "--rbind"; argv[ai++] = (char *)source;
-        argv[ai++] = (char *)target; argv[ai] = NULL;
-        return run_cmd("/bin/mount", argv);
-    }
-    if (flags & MS_BIND) {
-        argv[ai++] = "--bind"; argv[ai++] = (char *)source;
-        argv[ai++] = (char *)target; argv[ai] = NULL;
-        return run_cmd("/bin/mount", argv);
-    }
-    char opts[256]; int olen = 0;
-    if (flags & MS_RDONLY)  { if (olen) opts[olen++]=','; olen+=(int)str_copy(opts+olen,"ro",sizeof(opts)-olen); }
-    if (flags & MS_NOSUID)  { if (olen) opts[olen++]=','; olen+=(int)str_copy(opts+olen,"nosuid",sizeof(opts)-olen); }
-    if (flags & MS_NOEXEC)  { if (olen) opts[olen++]=','; olen+=(int)str_copy(opts+olen,"noexec",sizeof(opts)-olen); }
-    if (data && data[0])    { if (olen) opts[olen++]=','; str_copy(opts+olen,data,sizeof(opts)-olen); olen+=(int)lc_string_length(data); }
-    opts[olen] = '\0';
-    if (fstype && fstype[0]) { argv[ai++] = "-t"; argv[ai++] = (char *)fstype; }
-    if (olen > 0)            { argv[ai++] = "-o"; argv[ai++] = opts; }
-    if (source && source[0]) argv[ai++] = (char *)source;
-    argv[ai++] = (char *)target; argv[ai] = NULL;
-    return run_cmd("/bin/mount", argv);
+static void validate_volume_paths(const char *src, const char *dst) {
+    if (!src[0]) die("Error: volume source must not be empty");
+    if (src[0] != '/') die2("Error: volume source must be an absolute path: ", src);
+    if (lc_string_starts_with(src, lc_string_length(src), "/proc", 5) &&
+        (src[5] == '\0' || src[5] == '/'))
+        die2("Error: volume source under /proc is not allowed: ", src);
+    if (lc_string_starts_with(src, lc_string_length(src), "/sys", 4) &&
+        (src[4] == '\0' || src[4] == '/'))
+        die2("Error: volume source under /sys is not allowed: ", src);
+    if (lc_string_starts_with(src, lc_string_length(src), "/dev", 4) &&
+        (src[4] == '\0' || src[4] == '/'))
+        die2("Error: volume source under /dev is not allowed: ", src);
+    if (lc_string_starts_with(src, lc_string_length(src), "/.old_root", 10))
+        die2("Error: reserved volume source: ", src);
+    if (!dst[0]) die("Error: volume destination must not be empty");
+    if (dst[0] != '/') die2("Error: volume destination must be an absolute container path: ", dst);
+    if (streq(dst, "/")) die("Error: mounting over / is not allowed");
+    if (lc_string_starts_with(dst, lc_string_length(dst), "/proc", 5) &&
+        (dst[5] == '\0' || dst[5] == '/'))
+        die2("Error: volume destination under /proc is not allowed: ", dst);
+    if (lc_string_starts_with(dst, lc_string_length(dst), "/sys", 4) &&
+        (dst[4] == '\0' || dst[4] == '/'))
+        die2("Error: volume destination under /sys is not allowed: ", dst);
+    if (lc_string_starts_with(dst, lc_string_length(dst), "/dev", 4) &&
+        (dst[4] == '\0' || dst[4] == '/'))
+        die2("Error: volume destination under /dev is not allowed: ", dst);
+    if (lc_string_starts_with(dst, lc_string_length(dst), "/.old_root", 10))
+        die2("Error: reserved volume destination: ", dst);
 }
 
 /* Validate container name: [a-zA-Z0-9_-], max 12 chars */
-static void validate_name(const char *name) {
+void validate_name(const char *name) {
     if (!name || !name[0]) die("Error: container name required");
     size_t len = lc_string_length(name);
     if (len > NAME_MAX_LEN) die("Error: container name must be 12 characters or fewer");
@@ -359,243 +294,59 @@ static void validate_name(const char *name) {
     }
 }
 
-/* ─── Configuration ─────────────────────────────────────────────────────── */
-
-static void cfg_global_init(void) {
-    str_copy(cfg_global.lightbox_dir, "/etc/lightbox", MAX_PATH);
-    str_copy(cfg_global.rootfs, "/etc/lightbox/rootfs", MAX_PATH);
-    str_copy(cfg_global.container_dir, "/etc/lightbox/containers", MAX_PATH);
-    str_copy(cfg_global.run_dir, "/run", MAX_PATH);
-    str_copy(cfg_global.cgroup_root, "/sys/fs/cgroup", MAX_PATH);
-    str_copy(cfg_global.cgroup_base, "/sys/fs/cgroup/lightbox", MAX_PATH);
-    str_copy(cfg_global.bridge, "br0", sizeof(cfg_global.bridge));
-    str_copy(cfg_global.subnet, "10.0.0.0/24", sizeof(cfg_global.subnet));
-    str_copy(cfg_global.gw, "10.0.0.1", sizeof(cfg_global.gw));
-    str_copy(cfg_global.default_mem, "256M", sizeof(cfg_global.default_mem));
-    str_copy(cfg_global.default_pids, "128", sizeof(cfg_global.default_pids));
-    str_copy(cfg_global.default_cpu, "1", sizeof(cfg_global.default_cpu));
-    cfg_global.default_oom = 500;
+static bool uid_ranges_overlap(int start_a, int start_b) {
+    int end_a = start_a + USERNS_RANGE_SIZE;
+    int end_b = start_b + USERNS_RANGE_SIZE;
+    return !(end_a <= start_b || end_b <= start_a);
 }
 
-/* Apply a single key=value pair to the global config.
- * If lightbox_dir changes, recompute derived paths (rootfs, container_dir,
- * cgroup_base) unless they were explicitly set in the config file. */
-static void cfg_set(const char *key, const char *val, bool derived[3]) {
-    if (streq(key, "lightbox_dir")) {
-        str_copy(cfg_global.lightbox_dir, val, MAX_PATH);
-        /* recompute derived paths unless explicitly overridden */
-        if (!derived[0]) path_join(cfg_global.rootfs, MAX_PATH, val, "rootfs");
-        if (!derived[1]) path_join(cfg_global.container_dir, MAX_PATH, val, "containers");
-    }
-    else if (streq(key, "rootfs"))         { str_copy(cfg_global.rootfs, val, MAX_PATH); derived[0] = true; }
-    else if (streq(key, "container_dir"))  { str_copy(cfg_global.container_dir, val, MAX_PATH); derived[1] = true; }
-    else if (streq(key, "run_dir"))        str_copy(cfg_global.run_dir, val, MAX_PATH);
-    else if (streq(key, "cgroup_root"))    str_copy(cfg_global.cgroup_root, val, MAX_PATH);
-    else if (streq(key, "cgroup_base"))    { str_copy(cfg_global.cgroup_base, val, MAX_PATH); derived[2] = true; }
-    else if (streq(key, "bridge"))         str_copy(cfg_global.bridge, val, sizeof(cfg_global.bridge));
-    else if (streq(key, "subnet"))         str_copy(cfg_global.subnet, val, sizeof(cfg_global.subnet));
-    else if (streq(key, "gw"))             str_copy(cfg_global.gw, val, sizeof(cfg_global.gw));
-    else if (streq(key, "default_mem"))    str_copy(cfg_global.default_mem, val, sizeof(cfg_global.default_mem));
-    else if (streq(key, "default_pids"))   str_copy(cfg_global.default_pids, val, sizeof(cfg_global.default_pids));
-    else if (streq(key, "default_cpu"))    str_copy(cfg_global.default_cpu, val, sizeof(cfg_global.default_cpu));
-    else if (streq(key, "default_oom"))    cfg_global.default_oom = parse_int(val);
-}
+static bool userns_range_in_use(const char *exclude_name, int uid_start) {
+    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY, 0);
+    if (dirfd < 0) return false;
 
-/*
- * Load ~/.config/lightbox/lightbox.conf if it exists.
- * Format: key=value, one per line. Lines starting with # are comments.
- *
- * If lightbox_dir is set, rootfs and container_dir are derived from it
- * automatically unless they are also explicitly set.
- * Similarly, cgroup_base is derived from cgroup_root unless explicit.
- */
-static void cfg_global_load(char **envp) {
-    /* build config path: $HOME/.config/lightbox/lightbox.conf */
-    const char *home = env_get(envp, "HOME");
-    if (!home) home = "/root";
+    char dirbuf[4096];
+    bool in_use = false;
 
-    char conf_path[MAX_PATH];
-    path_join(conf_path, MAX_PATH, home, ".config/lightbox/lightbox.conf");
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, dirbuf, sizeof(dirbuf));
+        if (n <= 0) break;
 
-    char buf[CONF_BUF_SIZE];
-    int n = read_file(conf_path, buf, sizeof(buf));
-    if (n <= 0) return;
+        int64_t pos = 0;
+        while (pos < n) {
+            uint16_t reclen = *(uint16_t *)(dirbuf + pos + 16);
+            uint8_t dtype = *(uint8_t *)(dirbuf + pos + 18);
+            char *dname = dirbuf + pos + 19;
 
-    /* track which derived paths were explicitly set */
-    bool derived[3] = { false, false, false }; /* rootfs, container_dir, cgroup_base */
+            if (dtype == 4 /* DT_DIR */ && dname[0] != '.') {
+                if (exclude_name && streq(dname, exclude_name)) {
+                    pos += reclen;
+                    continue;
+                }
 
-    /* first pass: parse all key=value pairs */
-    char *p = buf;
-    while (*p) {
-        /* skip whitespace and comments */
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n') {
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
-            continue;
+                if (conf_get_int(dname, "userns", 0)) {
+                    int existing = conf_get_int(dname, "uid_start", 0);
+                    if (existing > 0 && uid_ranges_overlap(existing, uid_start)) {
+                        in_use = true;
+                        break;
+                    }
+                }
+            }
+            pos += reclen;
         }
-
-        /* find = */
-        char *eq = p;
-        while (*eq && *eq != '=' && *eq != '\n') eq++;
-        if (*eq != '=') { while (*p && *p != '\n') p++; if (*p == '\n') p++; continue; }
-
-        /* extract key (trim trailing spaces) */
-        char key[64];
-        size_t klen = (size_t)(eq - p);
-        while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t')) klen--;
-        if (klen >= sizeof(key)) klen = sizeof(key) - 1;
-        lc_bytes_copy(key, p, klen);
-        key[klen] = '\0';
-
-        /* extract value (trim leading spaces, ends at newline) */
-        char *vs = eq + 1;
-        while (*vs == ' ' || *vs == '\t') vs++;
-        char *ve = vs;
-        while (*ve && *ve != '\n') ve++;
-        /* trim trailing spaces */
-        char *vt = ve;
-        while (vt > vs && (vt[-1] == ' ' || vt[-1] == '\t')) vt--;
-
-        char val[MAX_PATH];
-        size_t vlen = (size_t)(vt - vs);
-        if (vlen >= sizeof(val)) vlen = sizeof(val) - 1;
-        lc_bytes_copy(val, vs, vlen);
-        val[vlen] = '\0';
-
-        cfg_set(key, val, derived);
-
-        p = ve;
-        if (*p == '\n') p++;
+        if (in_use) break;
     }
 
-    /* recompute cgroup_base from cgroup_root if not explicitly set */
-    if (!derived[2])
-        path_join(cfg_global.cgroup_base, MAX_PATH, cfg_global.cgroup_root, "lightbox");
-
-    /* LIGHTBOX_ROOTFS env var overrides config file */
-    const char *env_rootfs = env_get(envp, "LIGHTBOX_ROOTFS");
-    if (env_rootfs && env_rootfs[0])
-        str_copy(cfg_global.rootfs, env_rootfs, MAX_PATH);
+    lc_kernel_close_file((int32_t)dirfd);
+    return in_use;
 }
 
-/* ─── Path helpers ──────────────────────────────────────────────────────── */
-
-/*
- * Container directory layout:
- *   <container_dir>/<name>/rootfs/   — the container's root filesystem
- *   <container_dir>/<name>/.conf     — container config (key=value)
- *   <container_dir>/<name>/.ip       — assigned IP address
- *   <container_dir>/<name>/.pid      — PID of running container
- */
-
-/* Path to container base directory: <container_dir>/<name> */
-static void container_dir_path(char *buf, const char *name) {
-    path_join(buf, MAX_PATH, cfg_global.container_dir, name);
-}
-
-/* Path to container rootfs: <container_dir>/<name>/rootfs */
-static void container_root(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, "rootfs");
-}
-
-static void container_pid_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".pid");
-}
-
-static void container_ip_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".ip");
-}
-
-static void container_conf_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".conf");
-}
-
-/* ─── Config read/write ─────────────────────────────────────────────────── */
-
-/* Read a key from config file, return value or default */
-static int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def) {
-    char path[MAX_PATH], buf[2048];
-    container_conf_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) < 0) {
-        str_copy(val, def, valsz);
-        return 0;
+static int allocate_uid_start(const char *exclude_name) {
+    int candidate = USERNS_MIN_START;
+    for (int i = 0; i < 4096; i++, candidate += USERNS_RANGE_SIZE) {
+        if (!userns_range_in_use(exclude_name, candidate))
+            return candidate;
     }
-
-    size_t keylen = lc_string_length(key);
-    char *p = buf;
-    while (*p) {
-        /* check if this line starts with key= */
-        if (lc_string_starts_with(p, lc_string_length(p), key, keylen) && p[keylen] == '=') {
-            char *v = p + keylen + 1;
-            char *end = v;
-            while (*end && *end != '\n') end++;
-            size_t len = (size_t)(end - v);
-            if (len >= valsz) len = valsz - 1;
-            lc_bytes_copy(val, v, len);
-            val[len] = '\0';
-            return 1;
-        }
-        /* skip to next line */
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-    str_copy(val, def, valsz);
-    return 0;
-}
-
-static int conf_get_int(const char *name, const char *key, int def) {
-    char val[32];
-    if (conf_get(name, key, val, sizeof(val), "") && val[0])
-        return parse_int(val);
-    return def;
-}
-
-/* ─── Container state ───────────────────────────────────────────────────── */
-
-static int get_container_pid(const char *name) {
-    char path[MAX_PATH], buf[16];
-    container_pid_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) < 0) return -1;
-    return parse_int(buf);
-}
-
-static bool is_running(const char *name) {
-    int pid = get_container_pid(name);
-    if (pid <= 0) return false;
-
-    /* check if PID is alive */
-    if (lc_kernel_send_signal(pid, 0) < 0) {
-        /* stale pidfile — clean up */
-        char path[MAX_PATH];
-        container_pid_path(path, name);
-        lc_kernel_unlinkat(AT_FDCWD, path, 0);
-        return false;
-    }
-
-    /* verify it's in a different PID namespace */
-    char pid_ns[64], init_ns[64], proc_path[64];
-    char intbuf[16]; fmt_int(intbuf, pid);
-
-    size_t pos = str_copy(proc_path, "/proc/", sizeof(proc_path));
-    pos = str_append(proc_path, pos, intbuf, sizeof(proc_path));
-    str_append(proc_path, pos, "/ns/pid", sizeof(proc_path));
-
-    lc_sysret n1 = lc_kernel_readlinkat(AT_FDCWD, proc_path, pid_ns, sizeof(pid_ns) - 1);
-    lc_sysret n2 = lc_kernel_readlinkat(AT_FDCWD, "/proc/1/ns/pid", init_ns, sizeof(init_ns) - 1);
-    if (n1 <= 0 || n2 <= 0) return false;
-    pid_ns[n1] = '\0';
-    init_ns[n2] = '\0';
-
-    return !streq(pid_ns, init_ns);
+    return -1;
 }
 
 /* ─── Cgroup management ─────────────────────────────────────────────────── */
@@ -604,7 +355,7 @@ static void cgroup_path(char *buf, const char *name) {
     path_join(buf, MAX_PATH, cfg_global.cgroup_base, name);
 }
 
-static void cgroup_create(const char *name, int pid) {
+static int cgroup_create(const char *name, int pid) {
     char cg[MAX_PATH], tmp[MAX_PATH];
     cgroup_path(cg, name);
 
@@ -612,9 +363,9 @@ static void cgroup_create(const char *name, int pid) {
     lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
 
     path_join(tmp, MAX_PATH, cfg_global.cgroup_root, "cgroup.subtree_control");
-    write_file(tmp, "+memory +pids +cpu +io");
+    if (write_file(tmp, "+memory +pids +cpu +io") < 0) return -1;
     path_join(tmp, MAX_PATH, cfg_global.cgroup_base, "cgroup.subtree_control");
-    write_file(tmp, "+memory +pids +cpu +io");
+    if (write_file(tmp, "+memory +pids +cpu +io") < 0) return -1;
 
     lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
 
@@ -625,10 +376,10 @@ static void cgroup_create(const char *name, int pid) {
     conf_get(name, "cpu", cpu, sizeof(cpu), cfg_global.default_cpu);
 
     path_join(tmp, MAX_PATH, cg, "memory.max");
-    write_file(tmp, mem);
+    if (write_file(tmp, mem) < 0) return -1;
 
     path_join(tmp, MAX_PATH, cg, "pids.max");
-    write_file(tmp, pids);
+    if (write_file(tmp, pids) < 0) return -1;
 
     /* cpu: convert cores to quota */
     int cores = parse_int(cpu);
@@ -638,20 +389,21 @@ static void cgroup_create(const char *name, int pid) {
     int len = fmt_int(cpu_max, quota);
     str_append(cpu_max, (size_t)len, " 100000", sizeof(cpu_max));
     path_join(tmp, MAX_PATH, cg, "cpu.max");
-    write_file(tmp, cpu_max);
+    if (write_file(tmp, cpu_max) < 0) return -1;
 
     /* io limits */
     char io_spec[128];
     if (conf_get(name, "io", io_spec, sizeof(io_spec), "") && io_spec[0]) {
         path_join(tmp, MAX_PATH, cg, "io.max");
-        write_file(tmp, io_spec);
+        if (write_file(tmp, io_spec) < 0) return -1;
     }
 
     /* move container process into this cgroup */
     char pidbuf[16];
     fmt_int(pidbuf, pid);
     path_join(tmp, MAX_PATH, cg, "cgroup.procs");
-    write_file(tmp, pidbuf);
+    if (write_file(tmp, pidbuf) < 0) return -1;
+    return 0;
 }
 
 static void cgroup_destroy(const char *name) {
@@ -676,14 +428,26 @@ static void cgroup_destroy(const char *name) {
     lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
 }
 
+static void cgroup_join_self(const char *name) {
+    char cg[MAX_PATH], procs_path[MAX_PATH], pidbuf[16];
+    cgroup_path(cg, name);
+    path_join(procs_path, MAX_PATH, cg, "cgroup.procs");
+    fmt_int(pidbuf, lc_kernel_get_process_id());
+    require_write_file(procs_path, pidbuf);
+}
+
 /* ─── Security: capabilities ────────────────────────────────────────────── */
 
-/* Docker's default allowed capabilities */
+/* Default non-privileged container capabilities.
+ * Deliberately stricter than Docker's historical default:
+ * - no CAP_NET_RAW: avoid raw sockets/packet capture by default
+ * - no CAP_MKNOD: device node creation is unnecessary with our fixed /dev setup
+ */
 static const int ALLOWED_CAPS[] = {
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_FSETID,
     CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SETPCAP,
-    CAP_NET_BIND_SERVICE, CAP_NET_RAW, CAP_SYS_CHROOT,
-    CAP_MKNOD, CAP_AUDIT_WRITE, CAP_SETFCAP,
+    CAP_NET_BIND_SERVICE, CAP_SYS_CHROOT,
+    CAP_AUDIT_WRITE, CAP_SETFCAP,
 };
 #define N_ALLOWED_CAPS (sizeof(ALLOWED_CAPS) / sizeof(ALLOWED_CAPS[0]))
 
@@ -724,6 +488,9 @@ static const uint32_t BLOCKED_SYSCALLS[] = {
     313,  /* finit_module */
     177,  /* get_kernel_syms */
     239,  /* get_mempolicy */
+    425,  /* io_uring_setup */
+    426,  /* io_uring_enter */
+    427,  /* io_uring_register */
     175,  /* init_module */
     173,  /* ioperm */
     172,  /* iopl */
@@ -733,8 +500,10 @@ static const uint32_t BLOCKED_SYSCALLS[] = {
     250,  /* keyctl */
     212,  /* lookup_dcookie */
     237,  /* mbind */
+    256,  /* migrate_pages */
     /* 40, mount — allowed for container setup, blocked by caps */
     429,  /* move_mount */
+    279,  /* move_pages */
     303,  /* name_to_handle_at */
     180,  /* nfsservctl */
     304,  /* open_by_handle_at */
@@ -763,6 +532,7 @@ static const uint32_t BLOCKED_SYSCALLS[] = {
     323,  /* userfaultfd */
     136,  /* ustat */
     /* vm86/vm86old don't exist on x86_64 */
+    435,  /* clone3 */
     442,  /* mount_setattr */
     430,  /* fsopen */
     431,  /* fsconfig */
@@ -778,15 +548,23 @@ static void apply_seccomp(void) {
      *   for each blocked syscall: if equal, return ERRNO(EPERM)
      *   return ALLOW
      *
-     * Total instructions: 1 (load) + 2*N (check+deny per syscall) + 1 (allow)
+     * Total instructions:
+     *   1 arch load + 1 arch check + 1 kill +
+     *   1 nr load + 2*N (check+deny per syscall) + 1 allow
      */
     size_t n = N_BLOCKED_SYSCALLS;
-    size_t prog_len = 1 + 2 * n + 1;
+    size_t prog_len = 4 + 2 * n + 1;
     struct sock_filter filter[256]; /* plenty of room */
 
-    if (prog_len > sizeof(filter) / sizeof(filter[0])) return; /* safety */
+    if (prog_len > sizeof(filter) / sizeof(filter[0]))
+        die("Error: seccomp program too large");
 
     size_t idx = 0;
+
+    /* kill mismatched syscall ABIs */
+    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET);
+    filter[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);
+    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 
     /* load syscall number */
     filter[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET);
@@ -805,7 +583,8 @@ static void apply_seccomp(void) {
         .filter = filter,
     };
 
-    lc_kernel_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0);
+    if (lc_kernel_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+        die("Error: failed to install seccomp filter");
 }
 
 /* ─── Security: /proc masking ───────────────────────────────────────────── */
@@ -833,151 +612,16 @@ static void mask_proc_paths(void) {
     }
 }
 
-/* ─── cmd_setup ─────────────────────────────────────────────────────────── */
-
-/* Check if an iptables rule exists (-C), return 0 if it does */
-static int iptables_check(char *const argv[]) {
-    return run_cmd_quiet("/usr/sbin/iptables", argv);
-}
-
-/* Add an iptables rule only if it doesn't already exist */
-static void iptables_idempotent(char **check_argv, char **add_argv) {
-    if (iptables_check(check_argv) != 0)
-        run_cmd("/usr/sbin/iptables", add_argv);
-}
-
-/* Detect the default outbound network interface */
-static void detect_wan_interface(char *wan_if, size_t bufsz) {
-    char route_buf[256];
-    int pipefd[2];
-    lc_kernel_create_pipe(pipefd, 0);
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        lc_kernel_close_file(pipefd[0]);
-        lc_kernel_duplicate_fd(pipefd[1], STDOUT, 0);
-        lc_kernel_close_file(pipefd[1]);
-        char *argv[] = { "ip", "route", "show", "default", NULL };
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute("/sbin/ip", argv, envp);
-        lc_kernel_exit(1);
-    }
-    lc_kernel_close_file(pipefd[1]);
-    lc_sysret n = lc_kernel_read_bytes(pipefd[0], route_buf, sizeof(route_buf) - 1);
-    lc_kernel_close_file(pipefd[0]);
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    if (n <= 0) die("Error: could not detect default network interface");
-    route_buf[n] = '\0';
-
-    /* parse "default via X.X.X.X dev IFACE ..." */
-    const char *dev = NULL;
-    for (char *p = route_buf; *p; p++) {
-        if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == ' ') {
-            dev = p + 4;
-            break;
-        }
-    }
-    if (!dev) die("Error: could not parse default route");
-    size_t i = 0;
-    while (dev[i] && dev[i] != ' ' && dev[i] != '\n' && i < bufsz - 1) {
-        wan_if[i] = dev[i]; i++;
-    }
-    wan_if[i] = '\0';
-}
-
-static void cmd_setup(void) {
-    print_str(STDOUT, "Setting up host networking...\n");
-
-    /* create config and container directories */
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.lightbox_dir, 0755);
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.container_dir, 0755);
-
-    /* create bridge if it doesn't exist */
-    {
-        char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
-        if (run_cmd_quiet("/sbin/ip", show) != 0) {
-            print_str(STDOUT, "Creating bridge ");
-            print_str(STDOUT, cfg_global.bridge);
-            print_str(STDOUT, "...\n");
-            char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
-            run_cmd("/sbin/ip", add);
-            char gw_cidr[20];
-            str_copy(gw_cidr, cfg_global.gw, sizeof(gw_cidr));
-            str_append(gw_cidr, lc_string_length(gw_cidr), "/24", sizeof(gw_cidr));
-            char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
-            run_cmd("/sbin/ip", addr);
-            char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
-            run_cmd("/sbin/ip", up);
-        } else {
-            print_str(STDOUT, "Bridge ");
-            print_str(STDOUT, cfg_global.bridge);
-            print_str(STDOUT, " already exists, skipping\n");
-        }
-    }
-
-    /* mount cgroup2 if not already mounted */
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_root, 0755);
-    /* mount returns -EBUSY if already mounted — that's fine */
-    lc_kernel_mount("none", cfg_global.cgroup_root, "cgroup2", 0, NULL);
-
-    /* enable IP forwarding */
-    write_file("/proc/sys/net/ipv4/ip_forward", "1");
-
-    /* detect WAN interface */
-    char wan_if[32];
-    detect_wan_interface(wan_if, sizeof(wan_if));
-    print_str(STDOUT, "WAN interface: ");
-    print_str(STDOUT, wan_if);
-    lc_print_char(STDOUT, '\n');
-
-    /* NAT masquerade (idempotent — check before adding) */
-    {
-        char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING",
-                        "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
-        char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING",
-                        "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    /* FORWARD: bridge → WAN */
-    {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", wan_if, "-j", "ACCEPT", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", wan_if, "-j", "ACCEPT", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    /* FORWARD: WAN → bridge (established/related) */
-    {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", wan_if,
-                        "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
-                        "-j", "ACCEPT", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", wan_if,
-                        "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
-                        "-j", "ACCEPT", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    /* inter-container isolation: drop br0-to-br0 traffic */
-    {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", cfg_global.bridge, "-j", "DROP", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", cfg_global.bridge, "-j", "DROP", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    print_str(STDOUT, "Host networking ready\n");
-}
-
 /* ─── cmd_create ────────────────────────────────────────────────────────── */
 
 static void cmd_create(int argc, char **argv) {
+    require_tool("cp", tool_path_cp());
     if (argc < 2) die("Usage: lightbox create <name> <ip> [options]");
     const char *name = argv[0];
     const char *ip = argv[1];
     validate_name(name);
+    validate_ipv4_address(ip);
+    validate_ip_in_subnet(ip, cfg_global.subnet);
 
     /* parse options */
     container_config cfg = {0};
@@ -993,12 +637,15 @@ static void cmd_create(int argc, char **argv) {
             str_copy(cfg.mem, argv[++i], sizeof(cfg.mem));
         } else if (streq(argv[i], "--pids") && i + 1 < argc) {
             str_copy(cfg.pids, argv[++i], sizeof(cfg.pids));
+            validate_positive_integer_option("Error: pids must be a positive integer: ", cfg.pids);
         } else if (streq(argv[i], "--cpu") && i + 1 < argc) {
             str_copy(cfg.cpu, argv[++i], sizeof(cfg.cpu));
+            validate_positive_integer_option("Error: cpu must be a positive integer: ", cfg.cpu);
         } else if (streq(argv[i], "--userns")) {
-            cfg.userns = 1;
+            die("Error: --userns is not supported yet");
         } else if (streq(argv[i], "--uid-start") && i + 1 < argc) {
-            cfg.uid_start = parse_int(argv[++i]);
+            (void)argv[++i];
+            die("Error: --uid-start is not supported yet");
         } else if (streq(argv[i], "--privileged")) {
             cfg.privileged = 1;
         } else if (streq(argv[i], "--rootfs") && i + 1 < argc) {
@@ -1007,6 +654,7 @@ static void cmd_create(int argc, char **argv) {
             cfg.read_only = 1;
         } else if (streq(argv[i], "--oom-score") && i + 1 < argc) {
             cfg.oom_score = parse_int(argv[++i]);
+            validate_oom_score(cfg.oom_score);
         } else if (streq(argv[i], "--vol") && i + 1 < argc) {
             if (cfg.nvols >= MAX_VOLS) die("Error: too many volumes");
             /* parse src:dst[:ro] */
@@ -1030,12 +678,16 @@ static void cmd_create(int argc, char **argv) {
             if (dlen >= MAX_PATH) dlen = MAX_PATH - 1;
             lc_bytes_copy(cfg.vol_dst[cfg.nvols], dst_start, dlen);
             cfg.vol_dst[cfg.nvols][dlen] = '\0';
+            validate_volume_paths(cfg.vol_src[cfg.nvols], cfg.vol_dst[cfg.nvols]);
 
-            if (colon2 && colon2[1] == 'r' && colon2[2] == 'o')
+            if (colon2 && colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
                 cfg.vol_ro[cfg.nvols] = 1;
+            else if (colon2)
+                die2("Error: invalid volume mode in spec: ", spec);
             cfg.nvols++;
         } else if (streq(argv[i], "--link") && i + 1 < argc) {
             if (cfg.nlinks >= MAX_LINKS) die("Error: too many links");
+            validate_name(argv[i + 1]);
             str_copy(cfg.links[cfg.nlinks++], argv[++i], NAME_MAX_LEN + 1);
         } else {
             die2("Error: unknown option: ", argv[i]);
@@ -1052,16 +704,43 @@ static void cmd_create(int argc, char **argv) {
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
 
+    const char *create_err = NULL;
+    bool created_dir = false;
+
     /* create container directory and copy rootfs into it */
-    lc_kernel_mkdirat(AT_FDCWD, cdir, 0755);
-    if (!path_exists(cfg_global.rootfs))
-        die2("Error: rootfs not found: ", cfg_global.rootfs);
-    cp_a(cfg_global.rootfs, root);
+    if (lc_kernel_mkdirat(AT_FDCWD, cdir, 0755) < 0) {
+        create_err = "failed to create container dir";
+        goto fail_create;
+    }
+    created_dir = true;
+    set_container_state(name, "creating\n");
+    if (!path_exists(cfg_global.rootfs)) {
+        create_err = "rootfs not found";
+        goto fail_create;
+    }
+    {
+        lc_sysret pid = lc_kernel_fork();
+        if (pid == 0) {
+            char *argv2[] = { "cp", "-a", (char *)cfg_global.rootfs, root, NULL };
+            char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+            lc_kernel_execute(tool_path_cp(), argv2, envp);
+            lc_kernel_exit(1);
+        }
+        int32_t status;
+        lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+        if (((status >> 8) & 0xff) != 0) {
+            create_err = "failed to copy rootfs";
+            goto fail_create;
+        }
+    }
 
     /* store IP */
     char ip_path[MAX_PATH];
     container_ip_path(ip_path, name);
-    write_file(ip_path, ip);
+    if (write_file_atomic(ip_path, ip) < 0) {
+        create_err = "failed to write IP metadata";
+        goto fail_create;
+    }
 
     /* write config */
     char conf_path[MAX_PATH], conf_buf[1024];
@@ -1079,10 +758,20 @@ static void cmd_create(int argc, char **argv) {
     if (cfg.read_only) cpos = str_append(conf_buf, cpos, "readonly=1\n", sizeof(conf_buf));
     if (cfg.userns) {
         cpos = str_append(conf_buf, cpos, "userns=1\n", sizeof(conf_buf));
-        /* auto-allocate uid_start if not specified */
         if (cfg.uid_start == 0) {
-            cfg.uid_start = 100000;
-            /* TODO: scan existing configs for collisions */
+            cfg.uid_start = allocate_uid_start(name);
+            if (cfg.uid_start <= 0) {
+                create_err = "failed to allocate uid_start";
+                goto fail_create;
+            }
+        }
+        if (cfg.uid_start < USERNS_MIN_START) {
+            create_err = "uid_start is below the managed userns range";
+            goto fail_create;
+        }
+        if (userns_range_in_use(name, cfg.uid_start)) {
+            create_err = "uid_start overlaps an existing container userns range";
+            goto fail_create;
         }
         char uid_buf[16]; fmt_int(uid_buf, cfg.uid_start);
         cpos = str_append(conf_buf, cpos, "uid_start=", sizeof(conf_buf));
@@ -1108,15 +797,22 @@ static void cmd_create(int argc, char **argv) {
         cpos = str_append(conf_buf, cpos, cfg.links[i], sizeof(conf_buf));
         cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
     }
-    write_file(conf_path, conf_buf);
+    if (write_file_atomic(conf_path, conf_buf) < 0) {
+        create_err = "failed to write container config";
+        goto fail_create;
+    }
 
     /* write resolv.conf */
     char resolv[MAX_PATH];
     path_join(resolv, MAX_PATH, root, "etc/resolv.conf");
-    write_file(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n") < 0) {
+        create_err = "failed to write resolv.conf";
+        goto fail_create;
+    }
 
     /* shift rootfs ownership for user namespace */
     if (cfg.userns && cfg.uid_start > 0) {
+        require_tool("chown", tool_path_chown());
         print_str(STDOUT,"Shifting rootfs ownership...\n");
         /* use chown -R via fork+exec for simplicity */
         char uid_str[32];
@@ -1129,11 +825,15 @@ static void cmd_create(int argc, char **argv) {
         if (pid == 0) {
             char *argv2[] = { "chown", "-R", "-h", uid_str, root, NULL };
             char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-            lc_kernel_execute("/bin/chown", argv2, envp);
+            lc_kernel_execute(tool_path_chown(), argv2, envp);
             lc_kernel_exit(1);
         }
         int32_t status;
         lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+        if (((status >> 8) & 0xff) != 0) {
+            create_err = "failed to shift rootfs ownership";
+            goto fail_create;
+        }
     }
 
     print_str(STDOUT,"Container '");
@@ -1141,6 +841,22 @@ static void cmd_create(int argc, char **argv) {
     print_str(STDOUT,"' created (ip=");
     print_str(STDOUT,ip);
     print_str(STDOUT,")\n");
+    set_container_state(name, "stopped\n");
+    return;
+
+fail_create:
+    if (create_err) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, create_err);
+        if (streq(create_err, "rootfs not found")) {
+            print_str(STDERR, ": ");
+            print_str(STDERR, cfg_global.rootfs);
+        }
+        lc_print_char(STDERR, '\n');
+    }
+    if (created_dir)
+        require_rm_rf(cdir);
+    lc_kernel_exit(1);
 }
 
 /* ─── cmd_start: child process ──────────────────────────────────────────── */
@@ -1155,6 +871,230 @@ struct child_args {
     int          read_only;
 };
 
+static uint64_t sigmask_from_signal(int signum) {
+    return (signum > 0 && signum <= 64) ? (1ULL << (uint64_t)(signum - 1)) : 0;
+}
+
+static uint64_t supervisor_signal_mask(void) {
+    return sigmask_from_signal(SIGHUP) |
+           sigmask_from_signal(SIGINT) |
+           sigmask_from_signal(SIGQUIT) |
+           sigmask_from_signal(SIGTERM) |
+           sigmask_from_signal(SIGCHLD);
+}
+
+static void reap_children_nonblock(void) {
+    for (;;) {
+        int32_t status;
+        lc_sysret pid = lc_kernel_wait_for_child(-1, &status, WNOHANG);
+        if (pid <= 0) break;
+    }
+}
+
+static void run_init_hook_if_present(void) {
+    if (!path_exists("/init.sh")) return;
+
+    lc_sysret p = lc_kernel_fork();
+    if (p == 0) {
+        uint64_t empty_mask = 0;
+        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
+        char *a[] = { "/bin/sh", "/init.sh", NULL };
+        char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
+        lc_kernel_execute("/bin/sh", a, e);
+        lc_kernel_exit(1);
+    }
+
+    int32_t st;
+    lc_kernel_wait_for_child((int32_t)p, &st, 0);
+    if (((st >> 8) & 0xff) != 0)
+        die("Error: /init.sh failed");
+}
+
+static int supervisor_loop(void) {
+    uint64_t mask = supervisor_signal_mask();
+    if (lc_kernel_set_signal_mask(LC_SIG_BLOCK, &mask, NULL) < 0)
+        die("Error: failed to block supervisor signals");
+
+    lc_sysret sfd = lc_kernel_create_signal_fd(-1, &mask, SFD_CLOEXEC);
+    if (sfd < 0)
+        die("Error: failed to create signalfd");
+
+    for (;;) {
+        lc_signal_info si;
+        lc_sysret n = lc_kernel_read_bytes((int32_t)sfd, &si, sizeof(si));
+        if (n != (lc_sysret)sizeof(si))
+            die("Error: failed to read signalfd");
+
+        switch (si.signal) {
+            case SIGCHLD:
+                reap_children_nonblock();
+                break;
+            case SIGHUP:
+            case SIGINT:
+            case SIGQUIT:
+            case SIGTERM:
+                reap_children_nonblock();
+                lc_kernel_close_file((int32_t)sfd);
+                return 0;
+            default:
+                break;
+        }
+    }
+}
+
+static void build_proc_pid_path(char *buf, size_t bufsz, int pid, const char *suffix) {
+    char pidbuf[16];
+    fmt_int(pidbuf, pid);
+    size_t pos = str_copy(buf, "/proc/", bufsz);
+    pos = str_append(buf, pos, pidbuf, bufsz);
+    if (suffix && suffix[0])
+        str_append(buf, pos, suffix, bufsz);
+}
+
+static int open_target_path(int target_pid, const char *suffix) {
+    char path[64];
+    build_proc_pid_path(path, sizeof(path), target_pid, suffix);
+    return (int)lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0);
+}
+
+static void require_setns_fd(int fd, int nstype, const char *name) {
+    if (lc_kernel_setns(fd, nstype) < 0)
+        die2("Error: failed to join namespace: ", name);
+}
+
+static int exec_inside_container(const char *name, int target_pid, int userns,
+                                 int privileged, char *const cmd_argv[]) {
+    int rootfd = open_target_path(target_pid, "/root");
+    if (rootfd < 0)
+        die("Error: failed to open target root");
+
+    int userfd = -1;
+    if (userns) {
+        userfd = open_target_path(target_pid, "/ns/user");
+        if (userfd < 0)
+            die("Error: failed to open target user namespace");
+    }
+
+    int mntfd = open_target_path(target_pid, "/ns/mnt");
+    int utsfd = open_target_path(target_pid, "/ns/uts");
+    int ipcfd = open_target_path(target_pid, "/ns/ipc");
+    int netfd = open_target_path(target_pid, "/ns/net");
+    int pidfd = open_target_path(target_pid, "/ns/pid");
+    if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
+        die("Error: failed to open target namespace fd");
+
+    if (userns)
+        require_setns_fd(userfd, CLONE_NEWUSER, "user");
+
+    /* Join the host-side container cgroup before switching mount namespaces. */
+    cgroup_join_self(name);
+
+    require_setns_fd(mntfd, CLONE_NEWNS, "mount");
+    require_setns_fd(utsfd, CLONE_NEWUTS, "uts");
+    require_setns_fd(ipcfd, CLONE_NEWIPC, "ipc");
+    require_setns_fd(netfd, CLONE_NEWNET, "net");
+
+    if (lc_kernel_fchdir(rootfd) < 0)
+        die("Error: failed to chdir to target root");
+    if (lc_kernel_change_root(".") < 0)
+        die("Error: failed to chroot into target root");
+    if (lc_kernel_chdir("/") < 0)
+        die("Error: failed to chdir to container root");
+
+    require_setns_fd(pidfd, CLONE_NEWPID, "pid");
+
+    lc_sysret child = lc_kernel_fork();
+    if (child < 0)
+        die("Error: exec helper fork failed");
+
+    if (child == 0) {
+        uint64_t empty_mask = 0;
+        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
+
+        if (!privileged) {
+            drop_capabilities();
+            if (lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+                die("Error: failed to enable no_new_privs");
+            apply_seccomp();
+        }
+
+        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
+        lc_kernel_execute(cmd_argv[0], cmd_argv, envp);
+        die2("Error: failed to exec command: ", cmd_argv[0]);
+    }
+
+    int32_t status;
+    lc_kernel_wait_for_child((int32_t)child, &status, 0);
+    return status;
+}
+
+static void cleanup_start_failure(const char *name, const char *ip, const char *veth_host,
+                                  int child_pid, void *stack) {
+    if (child_pid > 0)
+        lc_kernel_send_signal(child_pid, SIGKILL);
+
+    if (veth_host && veth_host[0]) {
+        char *show[] = { "ip", "link", "show", (char *)veth_host, NULL };
+        if (run_cmd_quiet(tool_path_ip(), show) == 0) {
+            char *del[] = { "ip", "link", "delete", (char *)veth_host, NULL };
+            run_cmd(tool_path_ip(), del);
+        }
+    }
+
+    cgroup_destroy(name);
+    if (ip && ip[0])
+        (void)update_link_rules(name, ip, false);
+
+    {
+        char pid_path[MAX_PATH];
+        container_pid_path(pid_path, name);
+        lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
+        container_pid_start_path(pid_path, name);
+        lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
+    }
+
+    set_container_state(name, "failed\n");
+
+    if (stack && stack != MAP_FAILED)
+        lc_kernel_unmap_memory(stack, CHILD_STACK_SIZE);
+}
+
+static int delete_veth_if_present(const char *ifname) {
+    char *show[] = { "ip", "link", "show", (char *)ifname, NULL };
+    if (run_cmd_quiet(tool_path_ip(), show) != 0)
+        return 0;
+
+    char *del[] = { "ip", "link", "delete", (char *)ifname, NULL };
+    return run_cmd(tool_path_ip(), del);
+}
+
+static void require_mount_syscall(const char *source, const char *target,
+                                  const char *fstype, uint64_t flags, const char *data) {
+    if (lc_kernel_mount(source, target, fstype, flags, data) < 0)
+        die2("Error: mount failed: ", target);
+}
+
+static void enter_user_namespace_root(void) {
+    struct user_cap_header hdr = { 0x20080522, 0 };
+    struct user_cap_data data[2];
+
+    if (lc_kernel_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
+        die("Error: failed to enable keepcaps for userns");
+    if (lc_kernel_setgid(0) < 0)
+        die("Error: failed to setgid(0) in userns");
+    if (lc_kernel_setuid(0) < 0)
+        die("Error: failed to setuid(0) in userns");
+
+    if (lc_syscall2(SYS_capget, (int64_t)&hdr, (int64_t)data) < 0)
+        die("Error: capget failed in userns");
+
+    data[0].effective = data[0].permitted;
+    data[1].effective = data[1].permitted;
+
+    if (lc_syscall2(SYS_capset, (int64_t)&hdr, (int64_t)data) < 0)
+        die("Error: capset failed in userns");
+}
+
 /*
  * This function runs in the child after clone().
  * It sets up the container filesystem, applies security, and execs init.
@@ -1165,14 +1105,17 @@ static int container_child(void *arg) {
     /* close the write end so we only read */
     lc_kernel_close_file(ca->sync_pipe_wr);
 
-    /* make all mounts private — prevents host mount events (including
-     * the host's /proc) from propagating into the container */
-    do_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-
     /* wait for parent to set up uid/gid maps */
     char sync_byte;
     lc_kernel_read_bytes(ca->sync_pipe_rd, &sync_byte, 1);
     lc_kernel_close_file(ca->sync_pipe_rd);
+
+    if (ca->userns)
+        enter_user_namespace_root();
+
+    /* make all mounts private — prevents host mount events (including
+     * the host's /proc) from propagating into the container */
+    require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     /* set hostname */
     lc_kernel_sethostname(ca->name, lc_string_length(ca->name));
@@ -1212,14 +1155,17 @@ static int container_child(void *arg) {
                         if (mp == 0) {
                             char *a[] = { "mkdir", "-p", mount_point, NULL };
                             char *e[] = { NULL };
-                            lc_kernel_execute("/bin/mkdir", a, e);
+                            lc_kernel_execute(tool_path_mkdir(), a, e);
                             lc_kernel_exit(1);
                         }
                         int32_t st; lc_kernel_wait_for_child((int32_t)mp, &st, 0);
 
-                        do_mount(vol_line, mount_point, NULL, MS_BIND, NULL);
-                        if (ro)
-                            do_mount(NULL, mount_point, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
+                        require_mount(vol_line, mount_point, NULL, MS_BIND, NULL);
+                        {
+                            uint64_t remount_flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
+                            if (ro) remount_flags |= MS_RDONLY;
+                            require_mount(NULL, mount_point, NULL, remount_flags, NULL);
+                        }
                     }
                 }
             }
@@ -1232,7 +1178,7 @@ static int container_child(void *arg) {
     {
         char dev_path[MAX_PATH];
         path_join(dev_path, MAX_PATH, ca->root, "dev");
-        do_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
+        require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
         struct { const char *name; uint64_t dev; int mode; } devs[] = {
             { "null",    MAKEDEV(1, 3), 0666 },
@@ -1250,7 +1196,13 @@ static int container_child(void *arg) {
             /* create empty file as mount point */
             lc_sysret fd = lc_kernel_open_file(cont_dev, O_WRONLY | O_CREAT, devs[i].mode);
             if (fd >= 0) lc_kernel_close_file((int32_t)fd);
-            do_mount(host_dev, cont_dev, NULL, MS_BIND, NULL);
+            require_mount(host_dev, cont_dev, NULL, MS_BIND, NULL);
+            if (!ca->privileged) {
+                uint64_t dev_flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NOEXEC;
+                if (streq(devs[i].name, "random") || streq(devs[i].name, "urandom"))
+                    dev_flags |= MS_RDONLY;
+                require_mount(NULL, cont_dev, NULL, dev_flags, NULL);
+            }
         }
 
         /* pts and shm */
@@ -1262,44 +1214,38 @@ static int container_child(void *arg) {
     }
 
     /* pivot_root */
-    if (do_mount(ca->root, ca->root, NULL, MS_BIND | MS_REC, NULL) != 0)
-        die2("Error: bind mount rootfs failed: ", ca->root);
+    require_mount(ca->root, ca->root, NULL, MS_BIND | MS_REC, NULL);
     if (lc_kernel_chdir(ca->root) < 0)
         die2("Error: chdir to rootfs failed: ", ca->root);
     lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
     if (lc_kernel_pivot_root(".", ".old_root") < 0)
         die("Error: pivot_root failed");
-    { char *a[] = { "umount", "-l", "/.old_root", NULL }; run_cmd_quiet("/bin/umount", a); }
+    { char *a[] = { "umount", "-l", "/.old_root", NULL }; run_cmd_quiet(tool_path_umount(), a); }
     lc_kernel_unlinkat(AT_FDCWD, "/.old_root", AT_REMOVEDIR);
     lc_kernel_chdir("/");
 
-    /* mount proc, sys — use fork+exec of mount(8) rather than raw syscall,
-     * because busybox mount may handle proc namespace association differently */
-    {
-        lc_sysret p = lc_kernel_fork();
-        if (p == 0) {
-            char *a[] = { "mount", "-t", "proc", "proc", "/proc", NULL };
-            char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-            lc_kernel_execute("/bin/mount", a, e);
-            lc_kernel_exit(1);
-        }
-        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
-    }
-    {
-        lc_sysret p = lc_kernel_fork();
-        if (p == 0) {
-            char *a[] = { "mount", "-t", "sysfs", "sysfs", "/sys", "-o", "ro", NULL };
-            char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-            lc_kernel_execute("/bin/mount", a, e);
-            lc_kernel_exit(1);
-        }
-        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
-    }
+    /* Ensure standard mountpoints exist inside the container rootfs. */
+    lc_kernel_mkdirat(AT_FDCWD, "/proc", 0555);
+    lc_kernel_mkdirat(AT_FDCWD, "/sys", 0555);
+    lc_kernel_mkdirat(AT_FDCWD, "/tmp", 01777);
+    lc_kernel_mkdirat(AT_FDCWD, "/run", 0755);
+    lc_kernel_mkdirat(AT_FDCWD, "/var", 0755);
+    lc_kernel_mkdirat(AT_FDCWD, "/var/tmp", 01777);
+
+    /* mount proc with the raw syscall; busybox mount is not reliable here */
+    require_mount_syscall("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+
+    /*
+     * sysfs mounting is typically not permitted inside an unprivileged user
+     * namespace. Leave /sys as the rootfs directory in that mode.
+     */
+    if (!ca->userns)
+        require_mount_syscall("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
 
     /* devpts and shm inside container */
-    do_mount("devpts", "/dev/pts", "devpts",
-             MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666");
-    do_mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NOEXEC, NULL);
+    require_mount("devpts", "/dev/pts", "devpts",
+                  MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666");
+    require_mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
     /* symlinks in /dev */
     lc_kernel_symlinkat("/proc/self/fd", AT_FDCWD, "/dev/fd");
@@ -1315,7 +1261,7 @@ static int container_child(void *arg) {
 
     /* read-only rootfs */
     if (ca->read_only) {
-        do_mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY | MS_BIND, NULL);
+        require_mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY | MS_BIND, NULL);
     }
 
     /* bring up loopback */
@@ -1323,50 +1269,40 @@ static int container_child(void *arg) {
         char *a[] = { "ip", "link", "set", "lo", "up", NULL };
         char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
         lc_sysret p = lc_kernel_fork();
-        if (p == 0) { lc_kernel_execute("/sbin/ip", a, e); lc_kernel_exit(1); }
+        if (p == 0) { lc_kernel_execute(tool_path_ip(), a, e); lc_kernel_exit(1); }
         int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
+        if (((st >> 8) & 0xff) != 0) die("Error: failed to bring up loopback");
     }
 
     /* run /init.sh if present */
-    if (path_exists("/init.sh")) {
-        lc_sysret p = lc_kernel_fork();
-        if (p == 0) {
-            char *a[] = { "/bin/sh", "/init.sh", NULL };
-            char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
-            lc_kernel_execute("/bin/sh", a, e);
-            lc_kernel_exit(1);
-        }
-        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
-    }
+    run_init_hook_if_present();
 
     /* mount tmpfs for /tmp and /run (after init.sh, before signaling ready) */
-    do_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
-    do_mount("tmpfs", "/run", "tmpfs", 0, NULL);
+    require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
     if (ca->read_only)
-        do_mount("tmpfs", "/var/tmp", "tmpfs", 0, NULL);
+        require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 
     /* apply security sandbox (unless privileged) */
     if (!ca->privileged) {
         drop_capabilities();
-        lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+            die("Error: failed to enable no_new_privs");
         apply_seccomp();
     }
 
-    /* become the init process: exec sleep infinity */
-    char *init_argv[] = { "sleep", "infinity", NULL };
-    char *init_envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
-    lc_kernel_execute("/bin/sleep", init_argv, init_envp);
-
-    /* if exec fails */
-    die("Error: failed to exec container init");
-    return 1;
+    /* remain as PID 1 and reap adopted children until shutdown */
+    return supervisor_loop();
 }
 
 /* ─── cmd_start ─────────────────────────────────────────────────────────── */
 
-#define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
-
 static void cmd_start(int argc, char **argv) {
+    require_tool("ip", tool_path_ip());
+    require_tool("nsenter", tool_path_nsenter());
+    require_tool("mount", tool_path_mount());
+    require_tool("umount", tool_path_umount());
+    require_tool("mkdir", tool_path_mkdir());
     if (argc < 1) die("Usage: lightbox start <name>");
     const char *name = argv[0];
     validate_name(name);
@@ -1378,11 +1314,8 @@ static void cmd_start(int argc, char **argv) {
     if (is_running(name)) die2("Error: container is already running: ", name);
 
     /* read container IP */
-    char ip_path[MAX_PATH], ip[16];
-    container_ip_path(ip_path, name);
-    if (read_file(ip_path, ip, sizeof(ip)) < 0) die("Error: no IP file for container");
-    /* strip trailing newline */
-    for (int i = 0; ip[i]; i++) { if (ip[i] == '\n') { ip[i] = '\0'; break; } }
+    char ip[16];
+    if (read_container_ip(name, ip, sizeof(ip)) < 0) die("Error: no IP file for container");
 
     /* read config */
     int userns = conf_get_int(name, "userns", 0);
@@ -1391,9 +1324,18 @@ static void cmd_start(int argc, char **argv) {
     int read_only = conf_get_int(name, "readonly", 0);
     int oom_score = conf_get_int(name, "oom_score", cfg_global.default_oom);
 
+    if (userns)
+        die("Error: containers configured with user namespaces are not supported yet");
+
     print_str(STDOUT,"Starting container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
+    set_container_state(name, "starting\n");
+
+    const char *start_err = NULL;
+    int32_t child_pid = -1;
+    void *stack = MAP_FAILED;
+    int sync_pipe[2] = { -1, -1 };
 
     /* set up veth pair */
     char veth_host[16], veth_cont[16];
@@ -1404,25 +1346,26 @@ static void cmd_start(int argc, char **argv) {
         str_append(veth_cont, p2, name, sizeof(veth_cont));
     }
 
-    /* clean up stale veth if it exists */
-    { char *show[] = { "ip", "link", "show", veth_host, NULL };
-      if (run_cmd_quiet("/sbin/ip", show) == 0) {
-          char *del[] = { "ip", "link", "delete", veth_host, NULL };
-          run_cmd("/sbin/ip", del);
-      }
+    /* clean up stale veth endpoints if either name is left behind */
+    if (delete_veth_if_present(veth_host) != 0 ||
+        delete_veth_if_present(veth_cont) != 0) {
+        start_err = "failed to delete stale veth";
+        goto fail_start;
     }
 
     /* create veth pair */
     { char *a[] = { "ip", "link", "add", veth_cont, "type", "veth", "peer", "name", veth_host, NULL };
-      run_cmd("/sbin/ip", a); }
+      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to create veth pair"; goto fail_start; } }
     { char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
-      run_cmd("/sbin/ip", a); }
+      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach veth to bridge"; goto fail_start; } }
     { char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
-      run_cmd("/sbin/ip", a); }
+      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
     /* create sync pipe */
-    int sync_pipe[2];
-    lc_kernel_create_pipe(sync_pipe, O_CLOEXEC);
+    if (lc_kernel_create_pipe(sync_pipe, O_CLOEXEC) < 0) {
+        start_err = "failed to create sync pipe";
+        goto fail_start;
+    }
 
     /* set up clone flags */
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
@@ -1430,9 +1373,9 @@ static void cmd_start(int argc, char **argv) {
     if (userns) clone_flags |= CLONE_NEWUSER;
 
     /* allocate child stack */
-    void *stack = lc_kernel_map_memory(NULL, CHILD_STACK_SIZE,
-                                        PROT_READ | PROT_WRITE,
-                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    stack = lc_kernel_map_memory(NULL, CHILD_STACK_SIZE,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stack == MAP_FAILED) die("Error: failed to allocate child stack");
     void *stack_top = (char *)stack + CHILD_STACK_SIZE;
 
@@ -1449,8 +1392,8 @@ static void cmd_start(int argc, char **argv) {
 
     /* clone — lc_kernel_clone places fn+arg on the child's stack before
      * the syscall, so the child never touches our stack frame */
-    lc_sysret child_pid = lc_kernel_clone(clone_flags, stack_top,
-                                           container_child, &ca);
+    child_pid = (int32_t)lc_kernel_clone(clone_flags, stack_top,
+                                         container_child, &ca);
     if (child_pid < 0) die("Error: clone failed");
 
     /* parent continues */
@@ -1465,7 +1408,7 @@ static void cmd_start(int argc, char **argv) {
         size_t pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
         pp = str_append(proc_path, pp, pidbuf, sizeof(proc_path));
         str_append(proc_path, pp, "/setgroups", sizeof(proc_path));
-        write_file(proc_path, "deny");
+        if (write_file(proc_path, "deny") < 0) { start_err = "failed to write setgroups"; goto fail_start; }
 
         /* uid_map */
         pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
@@ -1477,13 +1420,13 @@ static void cmd_start(int argc, char **argv) {
             mp = str_append(map_buf, mp, ub, sizeof(map_buf));
             str_append(map_buf, mp, " 65536", sizeof(map_buf));
         }
-        write_file(proc_path, map_buf);
+        if (write_file(proc_path, map_buf) < 0) { start_err = "failed to write uid_map"; goto fail_start; }
 
         /* gid_map */
         pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
         pp = str_append(proc_path, pp, pidbuf, sizeof(proc_path));
         str_append(proc_path, pp, "/gid_map", sizeof(proc_path));
-        write_file(proc_path, map_buf);
+        if (write_file(proc_path, map_buf) < 0) { start_err = "failed to write gid_map"; goto fail_start; }
     }
 
     /*
@@ -1493,13 +1436,16 @@ static void cmd_start(int argc, char **argv) {
      */
 
     /* set up cgroup */
-    cgroup_create(name, (int)child_pid);
+    if (cgroup_create(name, (int)child_pid) != 0) {
+        start_err = "failed to create cgroup";
+        goto fail_start;
+    }
 
     /* move veth into container network namespace */
     {
         char nsbuf[16]; fmt_int(nsbuf, (int)child_pid);
         char *a[] = { "ip", "link", "set", veth_cont, "netns", nsbuf, NULL };
-        run_cmd("/sbin/ip", a);
+        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to move veth into netns"; goto fail_start; }
     }
 
     /* configure networking inside the container */
@@ -1510,11 +1456,11 @@ static void cmd_start(int argc, char **argv) {
         str_append(ip_cidr, lc_string_length(ip_cidr), "/24", sizeof(ip_cidr));
 
         char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
-        run_cmd("/usr/bin/nsenter", a1);
+        if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
         char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", veth_cont, NULL };
-        run_cmd("/usr/bin/nsenter", a2);
+        if (run_cmd(tool_path_nsenter(), a2) != 0) { start_err = "failed to assign container IP"; goto fail_start; }
         char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
-        run_cmd("/usr/bin/nsenter", a3);
+        if (run_cmd(tool_path_nsenter(), a3) != 0) { start_err = "failed to install default route"; goto fail_start; }
     }
 
     /* set OOM score */
@@ -1525,82 +1471,92 @@ static void cmd_start(int argc, char **argv) {
         pp = str_append(oom_path, pp, pidb, sizeof(oom_path));
         str_append(oom_path, pp, "/oom_score_adj", sizeof(oom_path));
         fmt_int(oom_buf, oom_score);
-        write_file(oom_path, oom_buf);
+        if (write_file(oom_path, oom_buf) < 0) { start_err = "failed to set oom_score_adj"; goto fail_start; }
     }
 
     /* unblock the child — it can now set up mounts, pivot_root, and exec init */
-    lc_kernel_write_bytes(sync_pipe[1], "x", 1);
+    if (lc_kernel_write_bytes(sync_pipe[1], "x", 1) != 1) {
+        start_err = "failed to signal container child";
+        goto fail_start;
+    }
     lc_kernel_close_file(sync_pipe[1]);
+    sync_pipe[1] = -1;
 
     /* wait for child to finish setup, then verify it's alive */
     lc_timespec ts = { .seconds = 0, .nanoseconds = 500000000 }; /* 500ms */
     lc_kernel_sleep(&ts);
 
-    if (lc_kernel_send_signal((int32_t)child_pid, 0) < 0) {
-        print_str(STDERR, "Error: container process died during startup\n");
-        char *a[] = { "ip", "link", "delete", veth_host, NULL };
-        run_cmd("/sbin/ip", a);
-        cgroup_destroy(name);
-        lc_kernel_exit(1);
-    }
-
-    /* write PID file only after confirming the child is alive */
-    char pid_path[MAX_PATH], pidbuf[16];
-    container_pid_path(pid_path, name);
-    fmt_int(pidbuf, (int)child_pid);
-    write_file(pid_path, pidbuf);
-
-    /* set up --link rules: allow traffic between this container and linked ones */
     {
-        char conf_buf2[2048];
-        char conf_p[MAX_PATH];
-        container_conf_path(conf_p, name);
-        if (read_file(conf_p, conf_buf2, sizeof(conf_buf2)) > 0) {
-            char *p = conf_buf2;
-            while (*p) {
-                if (p[0] == 'l' && p[1] == 'i' && p[2] == 'n' && p[3] == 'k' && p[4] == '=') {
-                    char link_name[NAME_MAX_LEN + 1];
-                    char *v = p + 5;
-                    char *end = v;
-                    while (*end && *end != '\n') end++;
-                    size_t ln = (size_t)(end - v);
-                    if (ln > NAME_MAX_LEN) ln = NAME_MAX_LEN;
-                    lc_bytes_copy(link_name, v, ln);
-                    link_name[ln] = '\0';
-
-                    /* look up the linked container's IP */
-                    char link_ip_path[MAX_PATH], link_ip[16];
-                    container_ip_path(link_ip_path, link_name);
-                    if (read_file(link_ip_path, link_ip, sizeof(link_ip)) > 0) {
-                        for (int j = 0; link_ip[j]; j++)
-                            if (link_ip[j] == '\n') { link_ip[j] = '\0'; break; }
-
-                        /* insert ACCEPT rules for both directions (before the DROP) */
-                        char *c1[] = { "iptables", "-C", "FORWARD",
-                                       "-s", ip, "-d", link_ip,
-                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                       "-j", "ACCEPT", NULL };
-                        char *a1[] = { "iptables", "-I", "FORWARD",
-                                       "-s", ip, "-d", link_ip,
-                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                       "-j", "ACCEPT", NULL };
-                        iptables_idempotent(c1, a1);
-                        char *c2[] = { "iptables", "-C", "FORWARD",
-                                       "-s", link_ip, "-d", ip,
-                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                       "-j", "ACCEPT", NULL };
-                        char *a2[] = { "iptables", "-I", "FORWARD",
-                                       "-s", link_ip, "-d", ip,
-                                       "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                       "-j", "ACCEPT", NULL };
-                        iptables_idempotent(c2, a2);
-                    }
-                }
-                while (*p && *p != '\n') p++;
-                if (*p == '\n') p++;
-            }
+        int32_t child_status;
+        lc_sysret waited = lc_kernel_wait_for_child((int32_t)child_pid, &child_status, WNOHANG);
+        if (waited == (lc_sysret)child_pid) {
+            start_err = "container process died during startup";
+            goto fail_start;
         }
     }
+
+    if (lc_kernel_send_signal((int32_t)child_pid, 0) < 0) {
+        start_err = "container process died during startup";
+        goto fail_start;
+    }
+
+    /* Persist both PID and its /proc starttime to guard against PID reuse. */
+    char pid_path[MAX_PATH], pidbuf[16], pid_start_path[MAX_PATH], pid_start[32];
+    container_pid_path(pid_path, name);
+    container_pid_start_path(pid_start_path, name);
+    fmt_int(pidbuf, (int)child_pid);
+    if (get_container_pid_starttime(name, pid_start, sizeof(pid_start)) == 0) {
+        start_err = "unexpected stale pid starttime metadata";
+        goto fail_start;
+    }
+    {
+        char proc_stat[64], statbuf[512];
+        size_t pos = str_copy(proc_stat, "/proc/", sizeof(proc_stat));
+        pos = str_append(proc_stat, pos, pidbuf, sizeof(proc_stat));
+        str_append(proc_stat, pos, "/stat", sizeof(proc_stat));
+        if (read_file(proc_stat, statbuf, sizeof(statbuf)) <= 0) {
+            start_err = "failed to read container proc stat";
+            goto fail_start;
+        }
+        char *p = statbuf;
+        char *last_paren = NULL;
+        while (*p) {
+            if (*p == ')') last_paren = p;
+            p++;
+        }
+        if (!last_paren) {
+            start_err = "failed to parse container proc stat";
+            goto fail_start;
+        }
+        p = last_paren + 1;
+        while (*p == ' ') p++;
+        for (int field = 3; field < 22; field++) {
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+        }
+        size_t len = 0;
+        while (p[len] && p[len] != ' ' && p[len] != '\n' && len < sizeof(pid_start) - 1)
+            len++;
+        if (len == 0 || len >= sizeof(pid_start) - 1) {
+            start_err = "failed to capture container starttime";
+            goto fail_start;
+        }
+        lc_bytes_copy(pid_start, p, len);
+        pid_start[len] = '\0';
+    }
+    if (write_file_atomic(pid_start_path, pid_start) < 0) {
+        start_err = "failed to write pid starttime file";
+        goto fail_start;
+    }
+    if (write_file_atomic(pid_path, pidbuf) < 0) {
+        start_err = "failed to write pid file";
+        goto fail_start;
+    }
+    if (update_link_rules(name, ip, true) != 0) {
+        start_err = "failed to install link iptables rules";
+        goto fail_start;
+    }
+    set_container_state(name, "running\n");
 
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
@@ -1615,6 +1571,18 @@ static void cmd_start(int argc, char **argv) {
 
     /* free child stack */
     lc_kernel_unmap_memory(stack, CHILD_STACK_SIZE);
+    return;
+
+fail_start:
+    if (sync_pipe[0] >= 0) lc_kernel_close_file(sync_pipe[0]);
+    if (sync_pipe[1] >= 0) lc_kernel_close_file(sync_pipe[1]);
+    if (start_err) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, start_err);
+        lc_print_char(STDERR, '\n');
+    }
+    cleanup_start_failure(name, ip, veth_host, child_pid, stack);
+    lc_kernel_exit(1);
 }
 
 /* ─── cmd_stop ──────────────────────────────────────────────────────────── */
@@ -1631,11 +1599,10 @@ static void cmd_stop(int argc, char **argv) {
     print_str(STDOUT,"Stopping container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
+    set_container_state(name, "stopping\n");
 
-    /* PID 1 in a PID namespace only receives signals it has registered
-     * handlers for.  sleep(1) doesn't handle SIGTERM, so send SIGKILL
-     * directly — killing PID 1 destroys the entire PID namespace. */
-    lc_kernel_send_signal(pid, SIGKILL);
+    /* Ask the in-container supervisor to exit cleanly before forcing SIGKILL. */
+    lc_kernel_send_signal(pid, SIGTERM);
 
     /* wait for process to exit */
     for (int i = 0; i < 10; i++) {
@@ -1643,6 +1610,9 @@ static void cmd_stop(int argc, char **argv) {
         lc_kernel_sleep(&ts);
         if (lc_kernel_send_signal(pid, 0) < 0) break;
     }
+
+    if (lc_kernel_send_signal(pid, 0) == 0)
+        lc_kernel_send_signal(pid, SIGKILL);
 
     /* wait for child to reap */
     int32_t status;
@@ -1653,65 +1623,10 @@ static void cmd_stop(int argc, char **argv) {
 
     /* clean up link iptables rules */
     {
-        char ip_path[MAX_PATH], ip_buf[16];
-        container_ip_path(ip_path, name);
-        if (read_file(ip_path, ip_buf, sizeof(ip_buf)) > 0) {
-            for (int j = 0; ip_buf[j]; j++)
-                if (ip_buf[j] == '\n') { ip_buf[j] = '\0'; break; }
-            /* delete any FORWARD rules referencing this container's IP on br0 */
-            char *d1[] = { "sh", "-c",
-                "iptables -S FORWARD 2>/dev/null | grep -- '-s ' | grep -- ' -i br0 ' | "
-                "while IFS= read -r rule; do "
-                "  case \"$rule\" in *" /* match container IP */ ") ;; *) continue;; esac; "
-                "  eval iptables $(echo \"$rule\" | sed 's/^-A/-D/'); "
-                "done", NULL };
-            (void)d1;
-            /* simpler approach: just try to delete rules with this IP */
-            char conf_buf3[2048], conf_p[MAX_PATH];
-            container_conf_path(conf_p, name);
-            if (read_file(conf_p, conf_buf3, sizeof(conf_buf3)) > 0) {
-                char *p = conf_buf3;
-                while (*p) {
-                    if (p[0] == 'l' && p[1] == 'i' && p[2] == 'n' && p[3] == 'k' && p[4] == '=') {
-                        char link_name[NAME_MAX_LEN + 1];
-                        char *v = p + 5, *end = v;
-                        while (*end && *end != '\n') end++;
-                        size_t ln = (size_t)(end - v);
-                        if (ln > NAME_MAX_LEN) ln = NAME_MAX_LEN;
-                        lc_bytes_copy(link_name, v, ln);
-                        link_name[ln] = '\0';
-
-                        char link_ip_path[MAX_PATH], link_ip[16];
-                        container_ip_path(link_ip_path, link_name);
-                        if (read_file(link_ip_path, link_ip, sizeof(link_ip)) > 0) {
-                            for (int k = 0; link_ip[k]; k++)
-                                if (link_ip[k] == '\n') { link_ip[k] = '\0'; break; }
-                            char *c1[] = { "iptables", "-C", "FORWARD",
-                                           "-s", ip_buf, "-d", link_ip,
-                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                           "-j", "ACCEPT", NULL };
-                            char *r1[] = { "iptables", "-D", "FORWARD",
-                                           "-s", ip_buf, "-d", link_ip,
-                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                           "-j", "ACCEPT", NULL };
-                            if (iptables_check(c1) == 0)
-                                run_cmd("/usr/sbin/iptables", r1);
-                            char *c2[] = { "iptables", "-C", "FORWARD",
-                                           "-s", link_ip, "-d", ip_buf,
-                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                           "-j", "ACCEPT", NULL };
-                            char *r2[] = { "iptables", "-D", "FORWARD",
-                                           "-s", link_ip, "-d", ip_buf,
-                                           "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                           "-j", "ACCEPT", NULL };
-                            if (iptables_check(c2) == 0)
-                                run_cmd("/usr/sbin/iptables", r2);
-                        }
-                    }
-                    while (*p && *p != '\n') p++;
-                    if (*p == '\n') p++;
-                }
-            }
+        char ip_buf[16];
+        if (read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
+            update_link_rules(name, ip_buf, false) != 0) {
+            print_str(STDERR, "Error: failed to remove link iptables rules\n");
         }
     }
 
@@ -1721,9 +1636,9 @@ static void cmd_stop(int argc, char **argv) {
         size_t p = str_copy(veth_host, "vb-", sizeof(veth_host));
         str_append(veth_host, p, name, sizeof(veth_host));
         char *show[] = { "ip", "link", "show", veth_host, NULL };
-        if (run_cmd_quiet("/sbin/ip", show) == 0) {
+        if (run_cmd_quiet(tool_path_ip(), show) == 0) {
             char *del[] = { "ip", "link", "delete", veth_host, NULL };
-            run_cmd("/sbin/ip", del);
+            run_cmd(tool_path_ip(), del);
         }
     }
 
@@ -1731,6 +1646,9 @@ static void cmd_stop(int argc, char **argv) {
     char pid_path[MAX_PATH];
     container_pid_path(pid_path, name);
     lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
+    container_pid_start_path(pid_path, name);
+    lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
+    set_container_state(name, "stopped\n");
 
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
@@ -1740,6 +1658,7 @@ static void cmd_stop(int argc, char **argv) {
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
 
 static void cmd_rm(int argc, char **argv) {
+    require_tool("rm", tool_path_rm());
     if (argc < 1) die("Usage: lightbox rm <name>");
     const char *name = argv[0];
     validate_name(name);
@@ -1757,7 +1676,7 @@ static void cmd_rm(int argc, char **argv) {
     cgroup_destroy(name);
 
     /* remove entire container directory (rootfs + metadata) */
-    rm_rf(cdir);
+    require_rm_rf(cdir);
 
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
@@ -1777,105 +1696,35 @@ static void cmd_exec(int argc, char **argv) {
     int userns = conf_get_int(name, "userns", 0);
     int privileged = conf_get_int(name, "privileged", 0);
 
-    /* build nsenter command */
-    char pidbuf[16]; fmt_int(pidbuf, pid);
+    if (userns)
+        die("Error: exec into userns containers is not supported yet");
 
-    (void)privileged; /* TODO: apply sandbox to exec'd processes */
-
-    /* build argv for nsenter:
-     * nsenter -t PID [-U] -m -u -i -n -p -- cmd [args...]
-     */
-    char *ns_argv[32];
+    char *cmd_argv[32];
     int ai = 0;
-    ns_argv[ai++] = "nsenter";
-    ns_argv[ai++] = "-t";
-    ns_argv[ai++] = pidbuf;
-    if (userns) ns_argv[ai++] = "-U";
-    ns_argv[ai++] = "-m";
-    ns_argv[ai++] = "-u";
-    ns_argv[ai++] = "-i";
-    ns_argv[ai++] = "-n";
-    ns_argv[ai++] = "-p";
-    ns_argv[ai++] = "-r";
-    ns_argv[ai++] = "-w";
-    ns_argv[ai++] = "--";
-
     if (argc > 1) {
-        for (int i = 1; i < argc && ai < 30; i++)
-            ns_argv[ai++] = argv[i];
+        for (int i = 1; i < argc && ai < 31; i++)
+            cmd_argv[ai++] = argv[i];
     } else {
-        ns_argv[ai++] = "/bin/sh";
+        cmd_argv[ai++] = "/bin/sh";
     }
-    ns_argv[ai] = NULL;
+    cmd_argv[ai] = NULL;
 
-    char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
-    lc_kernel_execute("/usr/bin/nsenter", ns_argv, envp);
-    die("Error: failed to exec nsenter");
+    lc_sysret worker = lc_kernel_fork();
+    if (worker < 0)
+        die("Error: failed to fork exec worker");
+
+    if (worker == 0) {
+        int status = exec_inside_container(name, pid, userns, privileged, cmd_argv);
+        int exit_code = (status & 0x7f) ? (128 + (status & 0x7f)) : ((status >> 8) & 0xff);
+        lc_kernel_exit(exit_code);
+    }
+
+    int32_t status;
+    lc_kernel_wait_for_child((int32_t)worker, &status, 0);
+    lc_kernel_exit((status & 0x7f) ? (128 + (status & 0x7f)) : ((status >> 8) & 0xff));
 }
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
-
-static void print_padded(const char *s, int width) {
-    print_str(STDOUT,s);
-    int len = (int)lc_string_length(s);
-    for (int i = len; i < width; i++) lc_print_char(STDOUT, ' ');
-}
-
-static void cmd_ls(void) {
-    print_padded("NAME", 20);
-    print_padded("IP", 16);
-    print_padded("STATUS", 10);
-    print_str(STDOUT,"PID\n");
-    print_padded("----", 20);
-    print_padded("--", 16);
-    print_padded("------", 10);
-    print_str(STDOUT,"---\n");
-
-    /* scan container directory */
-    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY, 0);
-    if (dirfd < 0) return;
-
-    char dirbuf[4096];
-    for (;;) {
-        lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, dirbuf, sizeof(dirbuf));
-        if (n <= 0) break;
-
-        int64_t pos = 0;
-        while (pos < n) {
-            /* struct linux_dirent64 */
-            uint64_t ino = *(uint64_t *)(dirbuf + pos);
-            (void)ino;
-            uint16_t reclen = *(uint16_t *)(dirbuf + pos + 16);
-            uint8_t dtype = *(uint8_t *)(dirbuf + pos + 18);
-            char *dname = dirbuf + pos + 19;
-
-            if (dtype == 4 /* DT_DIR */ && dname[0] != '.') {
-                /* this is a container */
-                char ip_buf[16] = "-";
-                char ip_path[MAX_PATH];
-                container_ip_path(ip_path, dname);
-                read_file(ip_path, ip_buf, sizeof(ip_buf));
-                /* strip newline */
-                for (int i = 0; ip_buf[i]; i++) { if (ip_buf[i] == '\n') { ip_buf[i] = '\0'; break; } }
-
-                const char *status = "stopped";
-                char pid_str[16] = "-";
-                if (is_running(dname)) {
-                    status = "running";
-                    fmt_int(pid_str, get_container_pid(dname));
-                }
-
-                print_padded(dname, 20);
-                print_padded(ip_buf, 16);
-                print_padded(status, 10);
-                print_str(STDOUT,pid_str);
-                lc_print_char(STDOUT, '\n');
-            }
-            pos += reclen;
-        }
-    }
-    lc_kernel_close_file((int32_t)dirfd);
-}
 
 /* ─── Usage ─────────────────────────────────────────────────────────────── */
 
@@ -1890,8 +1739,8 @@ static void usage(void) {
         "         --cpu  <num>           CPU cores (default: 1)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
-        "         --userns               Enable user namespace isolation\n"
-        "         --uid-start <n>        Host UID offset (default: auto)\n"
+        "         --userns               Future improvement; not supported yet\n"
+        "         --uid-start <n>        Future improvement; not supported yet\n"
         "         --read-only            Read-only root filesystem\n"
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
@@ -1900,6 +1749,8 @@ static void usage(void) {
         "  stop   <name>                 Stop a running container\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
         "  exec   <name> [cmd...]        Execute a command in a running container\n"
+        "  inspect <name>                Show container metadata and runtime state\n"
+        "  doctor                        Show host/runtime dependency status\n"
         "  ls                            List all containers\n"
         "  setup                         Setup host networking\n"
     );
@@ -1925,6 +1776,8 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
+    else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
+    else if (streq(cmd, "doctor")) cmd_doctor();
     else if (streq(cmd, "ls"))     cmd_ls();
     else                           usage();
 

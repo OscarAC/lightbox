@@ -3,20 +3,20 @@
 # Place this file at ~/.config/lightbox/lightbox.conf
 # All values are optional — built-in defaults are shown below.
 
-# Base directory for lightbox metadata (container configs, IP files)
-# lightbox_dir = /etc/lightbox
+# Base directory for lightbox data (base rootfs and container directories)
+# lightbox_dir = /var/lib/lightbox
 
 # Default rootfs to copy when creating containers
 # Can also be set via LIGHTBOX_ROOTFS env var or --rootfs flag
 # Derived from lightbox_dir if not set explicitly
-# rootfs = /etc/lightbox/rootfs
+# rootfs = /var/lib/lightbox/rootfs
 
 # Where containers are stored (each gets a subdirectory with rootfs/ and metadata)
 # Derived from lightbox_dir if not set explicitly
-# container_dir = /etc/lightbox/containers
+# container_dir = /var/lib/lightbox/containers
 
 # PID file directory
-# run_dir = /run
+# run_dir = /run/lightbox
 
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup

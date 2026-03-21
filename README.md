@@ -6,7 +6,8 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 
 - Linux with namespace and cgroup v2 support
 - GCC and ninja (build time)
-- `ip`, `iptables`, `nsenter` utilities (runtime)
+- `iproute2`, `iptables`, `util-linux` (`nsenter`) at runtime
+- BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
 - Root privileges
 
 ## Building
@@ -90,8 +91,8 @@ This creates:
 # Custom resource limits
 ./lightbox create app 10.0.0.2 --mem 512M --cpu 2 --pids 256
 
-# User namespace isolation (container root != host root)
-./lightbox create sandbox 10.0.0.3 --userns
+# User namespaces are planned but not supported yet
+# ./lightbox create sandbox 10.0.0.3 --userns
 
 # Read-only rootfs with a data volume
 ./lightbox create web 10.0.0.4 --read-only --vol /data/www:/var/www:ro
@@ -114,18 +115,18 @@ lightbox reads `~/.config/lightbox/lightbox.conf` at startup. All values have bu
 ```ini
 # ~/.config/lightbox/lightbox.conf
 
-# Base directory for lightbox metadata (container configs, IP files)
-lightbox_dir = /etc/lightbox
+# Base directory for lightbox data (base rootfs and container directories)
+lightbox_dir = /var/lib/lightbox
 
 # Default rootfs to copy when creating containers
 # Also overridable with LIGHTBOX_ROOTFS env var or --rootfs flag
-rootfs = /etc/lightbox/rootfs
+rootfs = /var/lib/lightbox/rootfs
 
 # Where containers are stored (each gets a subdirectory)
-container_dir = /etc/lightbox/containers
+container_dir = /var/lib/lightbox/containers
 
 # PID file directory
-run_dir = /run
+run_dir = /run/lightbox
 
 # cgroup v2 mount point
 cgroup_root = /sys/fs/cgroup
@@ -149,7 +150,7 @@ If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived
 1. `--rootfs <path>` flag on create (highest priority)
 2. `LIGHTBOX_ROOTFS` environment variable
 3. `rootfs` in `lightbox.conf`
-4. `/etc/lightbox/rootfs` (built-in default)
+4. `/var/lib/lightbox/rootfs` (built-in default)
 
 ## Command reference
 
@@ -174,8 +175,8 @@ lightbox <command> [args]
 | `--pids <limit>` | `128` | Max processes |
 | `--cpu <num>` | `1` | CPU cores |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable) |
-| `--userns` | off | User namespace with UID offset mapping |
-| `--uid-start <n>` | auto | Host UID offset for userns |
+| `--userns` | — | Future improvement; not supported yet |
+| `--uid-start <n>` | — | Future improvement; not supported yet |
 | `--read-only` | off | Read-only root filesystem |
 | `--privileged` | off | Disable security sandbox |
 | `--oom-score <n>` | `500` | OOM score adjustment |
@@ -193,7 +194,7 @@ All security features are on by default. Pass `--privileged` to disable.
 | /proc masking | Bind-mounts `/dev/null` over kcore, sysrq-trigger, etc. |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Container isolation | iptables drops br0-to-br0 traffic by default |
-| User namespaces | Optional UID offset mapping (`--userns`) |
+| User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |
 
 ## How it works
