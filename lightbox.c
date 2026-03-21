@@ -804,6 +804,9 @@ static void cmd_create(int argc, char **argv) {
 
     /* write resolv.conf */
     char resolv[MAX_PATH];
+    char etc_dir[MAX_PATH];
+    path_join(etc_dir, MAX_PATH, root, "etc");
+    lc_kernel_mkdirat(AT_FDCWD, etc_dir, 0755);
     path_join(resolv, MAX_PATH, root, "etc/resolv.conf");
     if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n") < 0) {
         create_err = "failed to write resolv.conf";
@@ -1068,12 +1071,6 @@ static int delete_veth_if_present(const char *ifname) {
     return run_cmd(tool_path_ip(), del);
 }
 
-static void require_mount_syscall(const char *source, const char *target,
-                                  const char *fstype, uint64_t flags, const char *data) {
-    if (lc_kernel_mount(source, target, fstype, flags, data) < 0)
-        die2("Error: mount failed: ", target);
-}
-
 static void enter_user_namespace_root(void) {
     struct user_cap_header hdr = { 0x20080522, 0 };
     struct user_cap_data data[2];
@@ -1232,15 +1229,15 @@ static int container_child(void *arg) {
     lc_kernel_mkdirat(AT_FDCWD, "/var", 0755);
     lc_kernel_mkdirat(AT_FDCWD, "/var/tmp", 01777);
 
-    /* mount proc with the raw syscall; busybox mount is not reliable here */
-    require_mount_syscall("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+    /* mount proc, sys */
+    require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
     /*
      * sysfs mounting is typically not permitted inside an unprivileged user
      * namespace. Leave /sys as the rootfs directory in that mode.
      */
     if (!ca->userns)
-        require_mount_syscall("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+        require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
 
     /* devpts and shm inside container */
     require_mount("devpts", "/dev/pts", "devpts",
