@@ -89,7 +89,7 @@ int update_link_rules(const char *name, const char *ip, bool add_rules);
 
 void cmd_setup(void);
 void cmd_doctor(void);
-void cmd_ls(void);
+void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
 
 #endif

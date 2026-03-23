@@ -1775,7 +1775,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
     else if (streq(cmd, "doctor")) cmd_doctor();
-    else if (streq(cmd, "ls"))     cmd_ls();
+    else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
     else                           usage();
 
     return 0;

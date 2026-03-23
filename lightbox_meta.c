@@ -6,19 +6,40 @@ static void print_padded(const char *s, int width) {
     for (int i = len; i < width; i++) lc_print_char(STDOUT, ' ');
 }
 
-void cmd_ls(void) {
-    print_padded("NAME", 20);
-    print_padded("IP", 16);
-    print_padded("STATUS", 10);
-    print_str(STDOUT, "PID\n");
-    print_padded("----", 20);
-    print_padded("--", 16);
-    print_padded("------", 10);
-    print_str(STDOUT, "---\n");
+static void json_str(const char *key, const char *val, bool comma) {
+    print_str(STDOUT, "\"");
+    print_str(STDOUT, key);
+    print_str(STDOUT, "\":\"");
+    print_str(STDOUT, val);
+    print_str(STDOUT, "\"");
+    if (comma) print_str(STDOUT, ",");
+}
+
+void cmd_ls(int argc, char **argv) {
+    bool json = false;
+    for (int i = 0; i < argc; i++)
+        if (streq(argv[i], "--json")) json = true;
+
+    if (!json) {
+        print_padded("NAME", 20);
+        print_padded("IP", 16);
+        print_padded("STATUS", 10);
+        print_str(STDOUT, "PID\n");
+        print_padded("----", 20);
+        print_padded("--", 16);
+        print_padded("------", 10);
+        print_str(STDOUT, "---\n");
+    } else {
+        print_str(STDOUT, "[");
+    }
 
     lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY, 0);
-    if (dirfd < 0) return;
+    if (dirfd < 0) {
+        if (json) print_str(STDOUT, "]\n");
+        return;
+    }
 
+    bool first = true;
     char dirbuf[4096];
     for (;;) {
         lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, dirbuf, sizeof(dirbuf));
@@ -47,16 +68,28 @@ void cmd_ls(void) {
                         status = state_buf;
                 }
 
-                print_padded(dname, 20);
-                print_padded(ip_buf, 16);
-                print_padded(status, 10);
-                print_str(STDOUT, pid_str);
-                lc_print_char(STDOUT, '\n');
+                if (json) {
+                    if (!first) print_str(STDOUT, ",");
+                    print_str(STDOUT, "{");
+                    json_str("name", dname, true);
+                    json_str("ip", ip_buf, true);
+                    json_str("status", status, true);
+                    json_str("pid", pid_str, false);
+                    print_str(STDOUT, "}");
+                    first = false;
+                } else {
+                    print_padded(dname, 20);
+                    print_padded(ip_buf, 16);
+                    print_padded(status, 10);
+                    print_str(STDOUT, pid_str);
+                    lc_print_char(STDOUT, '\n');
+                }
             }
             pos += reclen;
         }
     }
 
+    if (json) print_str(STDOUT, "]\n");
     lc_kernel_close_file((int32_t)dirfd);
 }
 
