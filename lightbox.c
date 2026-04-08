@@ -94,6 +94,9 @@ global_config cfg_global;
 /* clone flags (supplement those from syscall.h) */
 #define CLONE_VM        0x00000100
 #define CLONE_VFORK     0x00004000
+#ifndef O_DIRECTORY
+#define O_DIRECTORY     00200000
+#endif
 
 /* raw syscall numbers used by lightbox directly */
 #define SYS_fchdir      81
@@ -155,6 +158,12 @@ typedef struct {
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
 } container_config;
+
+typedef struct {
+    char src[MAX_PATH];
+    char dst[MAX_PATH];
+    int ro;
+} volume_spec;
 
 /* ─── Utility functions ─────────────────────────────────────────────────── */
 
@@ -279,6 +288,136 @@ static void validate_volume_paths(const char *src, const char *dst) {
         die2("Error: volume destination under /dev is not allowed: ", dst);
     if (lc_string_starts_with(dst, lc_string_length(dst), "/.old_root", 10))
         die2("Error: reserved volume destination: ", dst);
+}
+
+static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
+    const char *colon1 = NULL, *colon2 = NULL;
+    for (const char *p = spec; *p; p++) {
+        if (*p == ':') {
+            if (!colon1) colon1 = p;
+            else if (!colon2) colon2 = p;
+        }
+    }
+    if (!colon1) die("Error: volume format is src:dst[:ro]");
+
+    size_t slen = (size_t)(colon1 - spec);
+    if (slen == 0 || slen >= sizeof(vol->src))
+        die2("Error: invalid volume source in spec: ", spec);
+    lc_bytes_copy(vol->src, spec, slen);
+    vol->src[slen] = '\0';
+
+    const char *dst_start = colon1 + 1;
+    const char *dst_end = colon2 ? colon2 : spec + lc_string_length(spec);
+    size_t dlen = (size_t)(dst_end - dst_start);
+    if (dlen == 0 || dlen >= sizeof(vol->dst))
+        die2("Error: invalid volume destination in spec: ", spec);
+    lc_bytes_copy(vol->dst, dst_start, dlen);
+    vol->dst[dlen] = '\0';
+
+    vol->ro = 0;
+    if (colon2) {
+        if (colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
+            vol->ro = 1;
+        else
+            die2("Error: invalid volume mode in spec: ", spec);
+    }
+
+    validate_volume_paths(vol->src, vol->dst);
+}
+
+static bool path_is_directory(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0)
+        return false;
+    lc_kernel_close_file((int32_t)fd);
+    return true;
+}
+
+static void mkdir_p_or_die(const char *path) {
+    lc_sysret mp = lc_kernel_fork();
+    if (mp == 0) {
+        char *a[] = { "mkdir", "-p", (char *)path, NULL };
+        char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+        lc_kernel_execute(tool_path_mkdir(), a, e);
+        lc_kernel_exit(1);
+    }
+    int32_t st;
+    lc_kernel_wait_for_child((int32_t)mp, &st, 0);
+    if (((st >> 8) & 0xff) != 0)
+        die2("Error: mkdir -p failed: ", path);
+}
+
+static void parent_dir(char *buf, size_t bufsz, const char *path) {
+    size_t len = lc_string_length(path);
+    if (len == 0 || len >= bufsz)
+        die2("Error: invalid path: ", path);
+
+    str_copy(buf, path, bufsz);
+    while (len > 0 && buf[len - 1] != '/')
+        len--;
+
+    if (len == 0) {
+        str_copy(buf, ".", bufsz);
+    } else if (len == 1) {
+        buf[1] = '\0';
+    } else {
+        buf[len - 1] = '\0';
+    }
+}
+
+static bool container_has_volume(const char *name, const volume_spec *needle) {
+    char conf_path[MAX_PATH], conf_buf[2048];
+    container_conf_path(conf_path, name);
+    if (read_file(conf_path, conf_buf, sizeof(conf_buf)) <= 0)
+        return false;
+
+    char *p = conf_buf;
+    while (*p) {
+        if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
+            char line[MAX_PATH * 2 + 4];
+            char *end = p + 4;
+            while (*end && *end != '\n') end++;
+            size_t len = (size_t)(end - (p + 4));
+            if (len < sizeof(line)) {
+                lc_bytes_copy(line, p + 4, len);
+                line[len] = '\0';
+                volume_spec existing = {0};
+                parse_volume_spec_or_die(line, &existing);
+                if (streq(existing.src, needle->src) &&
+                    streq(existing.dst, needle->dst) &&
+                    existing.ro == needle->ro)
+                    return true;
+            }
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+
+    return false;
+}
+
+static void append_container_volume(const char *name, const volume_spec *vol) {
+    char conf_path[MAX_PATH], conf_buf[4096], new_buf[4300];
+    container_conf_path(conf_path, name);
+    int n = read_file(conf_path, conf_buf, sizeof(conf_buf));
+    if (n < 0)
+        die2("Error: failed to read container config: ", conf_path);
+
+    size_t pos = 0;
+    if (n > 0)
+        pos = str_copy(new_buf, conf_buf, sizeof(new_buf));
+    if (pos > 0 && new_buf[pos - 1] != '\n')
+        pos = str_append(new_buf, pos, "\n", sizeof(new_buf));
+
+    pos = str_append(new_buf, pos, "vol=", sizeof(new_buf));
+    pos = str_append(new_buf, pos, vol->src, sizeof(new_buf));
+    pos = str_append(new_buf, pos, ":", sizeof(new_buf));
+    pos = str_append(new_buf, pos, vol->dst, sizeof(new_buf));
+    if (vol->ro)
+        pos = str_append(new_buf, pos, ":ro", sizeof(new_buf));
+    pos = str_append(new_buf, pos, "\n", sizeof(new_buf));
+
+    require_write_file_atomic(conf_path, new_buf);
 }
 
 /* Validate container name: [a-zA-Z0-9_-], max 12 chars */
@@ -657,33 +796,11 @@ static void cmd_create(int argc, char **argv) {
             validate_oom_score(cfg.oom_score);
         } else if (streq(argv[i], "--vol") && i + 1 < argc) {
             if (cfg.nvols >= MAX_VOLS) die("Error: too many volumes");
-            /* parse src:dst[:ro] */
-            const char *spec = argv[++i];
-            const char *colon1 = NULL, *colon2 = NULL;
-            for (const char *p = spec; *p; p++) {
-                if (*p == ':') {
-                    if (!colon1) colon1 = p;
-                    else if (!colon2) colon2 = p;
-                }
-            }
-            if (!colon1) die("Error: volume format is src:dst[:ro]");
-            size_t slen = (size_t)(colon1 - spec);
-            if (slen >= MAX_PATH) slen = MAX_PATH - 1;
-            lc_bytes_copy(cfg.vol_src[cfg.nvols], spec, slen);
-            cfg.vol_src[cfg.nvols][slen] = '\0';
-
-            const char *dst_start = colon1 + 1;
-            const char *dst_end = colon2 ? colon2 : spec + lc_string_length(spec);
-            size_t dlen = (size_t)(dst_end - dst_start);
-            if (dlen >= MAX_PATH) dlen = MAX_PATH - 1;
-            lc_bytes_copy(cfg.vol_dst[cfg.nvols], dst_start, dlen);
-            cfg.vol_dst[cfg.nvols][dlen] = '\0';
-            validate_volume_paths(cfg.vol_src[cfg.nvols], cfg.vol_dst[cfg.nvols]);
-
-            if (colon2 && colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
-                cfg.vol_ro[cfg.nvols] = 1;
-            else if (colon2)
-                die2("Error: invalid volume mode in spec: ", spec);
+            volume_spec vol = {0};
+            parse_volume_spec_or_die(argv[++i], &vol);
+            str_copy(cfg.vol_src[cfg.nvols], vol.src, sizeof(cfg.vol_src[cfg.nvols]));
+            str_copy(cfg.vol_dst[cfg.nvols], vol.dst, sizeof(cfg.vol_dst[cfg.nvols]));
+            cfg.vol_ro[cfg.nvols] = vol.ro;
             cfg.nvols++;
         } else if (streq(argv[i], "--link") && i + 1 < argc) {
             if (cfg.nlinks >= MAX_LINKS) die("Error: too many links");
@@ -966,7 +1083,10 @@ static void require_setns_fd(int fd, int nstype, const char *name) {
 }
 
 static int exec_inside_container(const char *name, int target_pid, int userns,
-                                 int privileged, char *const cmd_argv[]) {
+                                 int privileged, int uid, int gid,
+                                 const char *home, const char *user_name,
+                                 int ngroups, const uint32_t *groups,
+                                 char *const cmd_argv[]) {
     int rootfd = open_target_path(target_pid, "/root");
     if (rootfd < 0)
         die("Error: failed to open target root");
@@ -1021,7 +1141,45 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
             apply_seccomp();
         }
 
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
+        if (ngroups >= 0) {
+            if (lc_kernel_setgroups((size_t)ngroups, groups) < 0)
+                die("Error: failed to set supplementary groups for exec");
+        }
+        if (gid >= 0) {
+            if (lc_kernel_setgid(gid) < 0)
+                die("Error: failed to setgid for exec");
+        }
+        if (uid >= 0) {
+            if (lc_kernel_setuid(uid) < 0)
+                die("Error: failed to setuid for exec");
+        }
+
+        char home_env[MAX_PATH + 6] = "HOME=";
+        if (home && home[0])
+            str_append(home_env, 5, home, sizeof(home_env));
+        else if (uid > 0)
+            str_append(home_env, 5, "/", sizeof(home_env));
+        else
+            str_append(home_env, 5, "/root", sizeof(home_env));
+
+        char user_env[NAME_MAX_LEN + 6] = "USER=";
+        char logname_env[NAME_MAX_LEN + 9] = "LOGNAME=";
+        if (user_name && user_name[0]) {
+            str_append(user_env, 5, user_name, sizeof(user_env));
+            str_append(logname_env, 8, user_name, sizeof(logname_env));
+        } else if (uid == 0) {
+            str_append(user_env, 5, "root", sizeof(user_env));
+            str_append(logname_env, 8, "root", sizeof(logname_env));
+        }
+
+        char *envp[6];
+        int ei = 0;
+        envp[ei++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+        envp[ei++] = home_env;
+        envp[ei++] = "TERM=xterm";
+        if (user_env[5]) envp[ei++] = user_env;
+        if (logname_env[8]) envp[ei++] = logname_env;
+        envp[ei] = NULL;
         lc_kernel_execute(cmd_argv[0], cmd_argv, envp);
         die2("Error: failed to exec command: ", cmd_argv[0]);
     }
@@ -1138,24 +1296,29 @@ static int container_child(void *arg) {
                     for (char *q = vol_line; *q; q++) {
                         if (*q == ':') { if (!colon1) colon1 = q; else if (!colon2) colon2 = q; }
                     }
-                    if (colon1) {
-                        *colon1 = '\0';
-                        char *dst = colon1 + 1;
-                        int ro = 0;
-                        if (colon2) { *colon2 = '\0'; ro = (colon2[1] == 'r'); }
+                        if (colon1) {
+                            *colon1 = '\0';
+                            char *dst = colon1 + 1;
+                            int ro = 0;
+                            if (colon2) { *colon2 = '\0'; ro = (colon2[1] == 'r'); }
 
-                        /* create mount point and bind */
+                        /* create the correct mount target type for file or directory binds */
                         char mount_point[MAX_PATH];
                         path_join(mount_point, MAX_PATH, ca->root, dst);
-                        /* mkdir -p via fork */
-                        lc_sysret mp = lc_kernel_fork();
-                        if (mp == 0) {
-                            char *a[] = { "mkdir", "-p", mount_point, NULL };
-                            char *e[] = { NULL };
-                            lc_kernel_execute(tool_path_mkdir(), a, e);
-                            lc_kernel_exit(1);
+                        if (!path_exists(vol_line))
+                            die2("Error: volume source does not exist: ", vol_line);
+
+                        if (path_is_directory(vol_line)) {
+                            mkdir_p_or_die(mount_point);
+                        } else {
+                            char parent[MAX_PATH];
+                            parent_dir(parent, sizeof(parent), mount_point);
+                            mkdir_p_or_die(parent);
+                            lc_sysret fd = lc_kernel_open_file(mount_point, O_WRONLY | O_CREAT, 0644);
+                            if (fd < 0)
+                                die2("Error: failed to create volume target file: ", mount_point);
+                            lc_kernel_close_file((int32_t)fd);
                         }
-                        int32_t st; lc_kernel_wait_for_child((int32_t)mp, &st, 0);
 
                         require_mount(vol_line, mount_point, NULL, MS_BIND, NULL);
                         {
@@ -1652,6 +1815,45 @@ static void cmd_stop(int argc, char **argv) {
     print_str(STDOUT,"' stopped\n");
 }
 
+static void cmd_add_vol(int argc, char **argv) {
+    if (argc < 2) die("Usage: lightbox add-vol <name> <src:dst[:ro]>");
+    const char *name = argv[0];
+    validate_name(name);
+
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    if (!path_exists(cdir)) die2("Error: container does not exist: ", name);
+
+    volume_spec vol = {0};
+    parse_volume_spec_or_die(argv[1], &vol);
+
+    if (!path_exists(vol.src))
+        die2("Error: volume source does not exist: ", vol.src);
+
+    if (container_has_volume(name, &vol)) {
+        print_str(STDOUT, "Volume already present for container '");
+        print_str(STDOUT, name);
+        print_str(STDOUT, "'\n");
+        return;
+    }
+
+    append_container_volume(name, &vol);
+
+    print_str(STDOUT, "Added volume to container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "': ");
+    print_str(STDOUT, vol.src);
+    print_str(STDOUT, " -> ");
+    print_str(STDOUT, vol.dst);
+    if (vol.ro)
+        print_str(STDOUT, " (ro)");
+    lc_print_char(STDOUT, '\n');
+
+    if (is_running(name)) {
+        print_str(STDOUT, "Restart the container for the new volume to take effect\n");
+    }
+}
+
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
 
 static void cmd_rm(int argc, char **argv) {
@@ -1682,8 +1884,246 @@ static void cmd_rm(int argc, char **argv) {
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
 
+/* Resolve a username from the container's /etc/passwd.
+ * Returns 0 on success, -1 if user not found. */
+static int resolve_passwd_user(const char *name, const char *username,
+                               int *out_uid, int *out_gid,
+                               char *out_home, size_t home_sz) {
+    char root[MAX_PATH];
+    container_root(root, name);
+
+    char passwd_path[MAX_PATH];
+    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
+
+    char buf[4096];
+    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
+        return -1;
+
+    size_t ulen = lc_string_length(username);
+
+    /* scan line by line: user:x:uid:gid:gecos:home:shell */
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        /* find end of line */
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') *p++ = '\0';
+
+        /* match username before first colon */
+        char *c1 = NULL;
+        for (char *q = line; *q; q++) {
+            if (*q == ':') { c1 = q; break; }
+        }
+        if (!c1) continue;
+        if ((size_t)(c1 - line) != ulen) continue;
+
+        bool match = true;
+        for (size_t i = 0; i < ulen; i++) {
+            if (line[i] != username[i]) { match = false; break; }
+        }
+        if (!match) continue;
+
+        /* skip password field (field 2) */
+        char *f = c1 + 1;
+        char *c2 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c2 = q; break; }
+        }
+        if (!c2) continue;
+
+        /* uid field (field 3) */
+        f = c2 + 1;
+        char *c3 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c3 = q; break; }
+        }
+        if (!c3) continue;
+        *c3 = '\0';
+        *out_uid = parse_int(f);
+
+        /* gid field (field 4) */
+        f = c3 + 1;
+        char *c4 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c4 = q; break; }
+        }
+        if (!c4) continue;
+        *c4 = '\0';
+        *out_gid = parse_int(f);
+
+        /* skip gecos (field 5) */
+        f = c4 + 1;
+        char *c5 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c5 = q; break; }
+        }
+        if (!c5) continue;
+
+        /* home field (field 6) */
+        f = c5 + 1;
+        char *c6 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c6 = q; break; }
+        }
+        if (c6) *c6 = '\0';
+        str_copy(out_home, f, home_sz);
+
+        return 0;
+    }
+    return -1;
+}
+
+/* Resolve an account by numeric UID from the container's /etc/passwd.
+ * Returns 0 on success, -1 if user not found. */
+static int resolve_passwd_uid(const char *name, int uid,
+                              char *out_user, size_t user_sz,
+                              int *out_gid,
+                              char *out_home, size_t home_sz) {
+    char root[MAX_PATH];
+    container_root(root, name);
+
+    char passwd_path[MAX_PATH];
+    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
+
+    char buf[4096];
+    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
+        return -1;
+
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') *p++ = '\0';
+
+        char *c1 = NULL;
+        for (char *q = line; *q; q++) {
+            if (*q == ':') { c1 = q; break; }
+        }
+        if (!c1) continue;
+        *c1 = '\0';
+
+        char *f = c1 + 1;
+        char *c2 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c2 = q; break; }
+        }
+        if (!c2) continue;
+
+        f = c2 + 1;
+        char *c3 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c3 = q; break; }
+        }
+        if (!c3) continue;
+        *c3 = '\0';
+        if (parse_int(f) != uid)
+            continue;
+
+        f = c3 + 1;
+        char *c4 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c4 = q; break; }
+        }
+        if (!c4) continue;
+        *c4 = '\0';
+        *out_gid = parse_int(f);
+
+        f = c4 + 1;
+        char *c5 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c5 = q; break; }
+        }
+        if (!c5) continue;
+
+        f = c5 + 1;
+        char *c6 = NULL;
+        for (char *q = f; *q; q++) {
+            if (*q == ':') { c6 = q; break; }
+        }
+        if (c6) *c6 = '\0';
+
+        str_copy(out_user, line, user_sz);
+        str_copy(out_home, f, home_sz);
+        return 0;
+    }
+
+    return -1;
+}
+
+static int resolve_group_memberships(const char *name, const char *username,
+                                     int primary_gid, uint32_t *out_groups,
+                                     int max_groups) {
+    char root[MAX_PATH];
+    container_root(root, name);
+
+    char group_path[MAX_PATH];
+    path_join(group_path, sizeof(group_path), root, "etc/group");
+
+    char buf[4096];
+    if (read_file(group_path, buf, sizeof(buf)) < 0)
+        return 0;
+
+    size_t ulen = lc_string_length(username);
+    int count = 0;
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') *p++ = '\0';
+        if (!line[0]) continue;
+
+        char *c1 = NULL, *c2 = NULL, *c3 = NULL;
+        for (char *q = line; *q; q++) {
+            if (*q == ':') {
+                if (!c1) c1 = q;
+                else if (!c2) c2 = q;
+                else { c3 = q; break; }
+            }
+        }
+        if (!c1 || !c2 || !c3) continue;
+
+        char *gid_field = c2 + 1;
+        *c3 = '\0';
+        int gid = parse_int(gid_field);
+        if (gid == primary_gid)
+            continue;
+
+        char *members = c3 + 1;
+        bool member = false;
+        while (*members) {
+            char *entry = members;
+            while (*members && *members != ',') members++;
+            char saved = *members;
+            *members = '\0';
+
+            size_t len = lc_string_length(entry);
+            if (len == ulen) {
+                member = true;
+                for (size_t i = 0; i < ulen; i++) {
+                    if (entry[i] != username[i]) {
+                        member = false;
+                        break;
+                    }
+                }
+                if (member) break;
+            }
+
+            *members = saved;
+            if (saved == ',') members++;
+        }
+
+        if (member) {
+            if (count >= max_groups)
+                die("Error: too many supplementary groups for exec user");
+            out_groups[count++] = (uint32_t)gid;
+        }
+    }
+
+    return count;
+}
+
 static void cmd_exec(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox exec <name> [cmd...]");
+    if (argc < 1) die("Usage: lightbox exec <name> [--user <uid[:gid]>] [cmd...]");
     const char *name = argv[0];
     validate_name(name);
 
@@ -1696,10 +2136,73 @@ static void cmd_exec(int argc, char **argv) {
     if (userns)
         die("Error: exec into userns containers is not supported yet");
 
+    /* parse exec options */
+    int uid = -1;
+    int gid = -1;
+    char home[MAX_PATH] = {0};
+    char user_name[NAME_MAX_LEN + 1] = {0};
+    uint32_t groups[32];
+    int ngroups = -1;
+    int cmd_start = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (streq(argv[i], "--user") && i + 1 < argc) {
+            const char *spec = argv[++i];
+
+            /* check if spec starts with a digit — numeric uid[:gid] */
+            bool numeric = (spec[0] >= '0' && spec[0] <= '9');
+
+            if (numeric) {
+                const char *colon = NULL;
+                bool explicit_gid = false;
+                for (const char *p = spec; *p; p++) {
+                    if (*p == ':') { colon = p; break; }
+                }
+                if (colon) {
+                    explicit_gid = true;
+                    char uid_buf[16];
+                    size_t uid_len = (size_t)(colon - spec);
+                    if (uid_len == 0 || uid_len >= sizeof(uid_buf))
+                        die("Error: invalid uid in --user");
+                    for (size_t j = 0; j < uid_len; j++)
+                        uid_buf[j] = spec[j];
+                    uid_buf[uid_len] = '\0';
+                    uid = parse_int(uid_buf);
+                    gid = parse_int(colon + 1);
+                } else {
+                    uid = parse_int(spec);
+                    gid = uid;
+                }
+                if (uid < 0) die("Error: invalid uid in --user");
+                if (gid < 0) die("Error: invalid gid in --user");
+
+                int passwd_gid = gid;
+                if (resolve_passwd_uid(name, uid, user_name, sizeof(user_name), &passwd_gid,
+                                       home, sizeof(home)) == 0) {
+                    int primary_gid = explicit_gid ? gid : passwd_gid;
+                    if (!explicit_gid)
+                        gid = passwd_gid;
+                    ngroups = resolve_group_memberships(name, user_name, primary_gid, groups,
+                                                        (int)(sizeof(groups) / sizeof(groups[0])));
+                }
+            } else {
+                /* resolve username from container's /etc/passwd */
+                if (resolve_passwd_user(name, spec, &uid, &gid, home, sizeof(home)) < 0)
+                    die2("Error: user not found in container: ", spec);
+                str_copy(user_name, spec, sizeof(user_name));
+                ngroups = resolve_group_memberships(name, spec, gid, groups, (int)(sizeof(groups) / sizeof(groups[0])));
+            }
+            cmd_start = i + 1;
+        } else {
+            cmd_start = i;
+            break;
+        }
+    }
+
     char *cmd_argv[32];
     int ai = 0;
-    if (argc > 1) {
-        for (int i = 1; i < argc && ai < 31; i++)
+    if (cmd_start < argc) {
+        for (int i = cmd_start; i < argc && ai < 31; i++)
             cmd_argv[ai++] = argv[i];
     } else {
         cmd_argv[ai++] = "/bin/sh";
@@ -1711,7 +2214,9 @@ static void cmd_exec(int argc, char **argv) {
         die("Error: failed to fork exec worker");
 
     if (worker == 0) {
-        int status = exec_inside_container(name, pid, userns, privileged, cmd_argv);
+        int status = exec_inside_container(name, pid, userns, privileged,
+                                           uid, gid, home, user_name,
+                                           ngroups, groups, cmd_argv);
         int exit_code = (status & 0x7f) ? (128 + (status & 0x7f)) : ((status >> 8) & 0xff);
         lc_kernel_exit(exit_code);
     }
@@ -1744,8 +2249,10 @@ static void usage(void) {
         "         --link <name>          Allow network to another container\n"
         "  start  <name>                 Start a stopped container\n"
         "  stop   <name>                 Stop a running container\n"
+        "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
-        "  exec   <name> [cmd...]        Execute a command in a running container\n"
+        "  exec   <name> [options] [cmd...]  Execute a command in a running container\n"
+        "         --user <name|uid[:gid]> Run as specified user/group (default: root)\n"
         "  inspect <name>                Show container metadata and runtime state\n"
         "  doctor                        Show host/runtime dependency status\n"
         "  ls                            List all containers\n"
@@ -1771,6 +2278,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "create")) cmd_create(sub_argc, sub_argv);
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
+    else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);

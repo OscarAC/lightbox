@@ -97,6 +97,9 @@ This creates:
 # Read-only rootfs with a data volume
 ./lightbox create web 10.0.0.4 --read-only --vol /data/www:/var/www:ro
 
+# Mount a host file into the container
+./lightbox create app 10.0.0.6 --vol /srv/config/app.conf:/etc/app.conf:ro
+
 # Use a different rootfs image
 ./lightbox create deb 10.0.0.5 --rootfs /opt/rootfs/debian
 
@@ -106,6 +109,10 @@ This creates:
 # Allow two containers to talk to each other
 ./lightbox create api 10.0.0.10 --link db
 ./lightbox create db  10.0.0.11
+
+# Add a volume to an existing container configuration
+./lightbox add-vol app /srv/config/app.conf:/etc/app.conf:ro
+# Restart if the container is already running
 ```
 
 ## Configuration
@@ -161,6 +168,7 @@ lightbox <command> [args]
   create <name> <ip> [options]  Create a new container
   start  <name>                 Start a stopped container
   stop   <name>                 Stop a running container
+  add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
   exec   <name> [cmd...]        Run a command in a container
   ls                            List all containers
@@ -207,3 +215,9 @@ All security features are on by default. Pass `--privileged` to disable.
 - **Init**: `sleep infinity` as PID 1 inside the container
 - **External tools**: `ip` and `iptables` for networking (fork+exec); everything else is direct syscalls
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
+
+## Volume Notes
+
+- `--vol` now supports both directory and single-file bind mounts.
+- `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config.
+- If the container is already running, added volumes take effect after a restart.
