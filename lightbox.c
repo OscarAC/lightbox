@@ -1030,6 +1030,15 @@ static void run_init_hook_if_present(void) {
         die("Error: /init.sh failed");
 }
 
+static void cleanup_old_root_or_die(void) {
+    if (lc_kernel_umount("/.old_root", MNT_DETACH) < 0)
+        die("Error: failed to unmount /.old_root");
+    if (lc_kernel_unlinkat(AT_FDCWD, "/.old_root", AT_REMOVEDIR) < 0)
+        die("Error: failed to remove /.old_root");
+    if (path_exists("/.old_root"))
+        die("Error: /.old_root is still reachable after cleanup");
+}
+
 static int supervisor_loop(void) {
     uint64_t mask = supervisor_signal_mask();
     if (lc_kernel_set_signal_mask(LC_SIG_BLOCK, &mask, NULL) < 0)
@@ -1380,8 +1389,7 @@ static int container_child(void *arg) {
     lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
     if (lc_kernel_pivot_root(".", ".old_root") < 0)
         die("Error: pivot_root failed");
-    { char *a[] = { "umount", "-l", "/.old_root", NULL }; run_cmd_quiet(tool_path_umount(), a); }
-    lc_kernel_unlinkat(AT_FDCWD, "/.old_root", AT_REMOVEDIR);
+    cleanup_old_root_or_die();
     lc_kernel_chdir("/");
 
     /* Ensure standard mountpoints exist inside the container rootfs. */
@@ -1434,14 +1442,15 @@ static int container_child(void *arg) {
         if (((st >> 8) & 0xff) != 0) die("Error: failed to bring up loopback");
     }
 
-    /* run /init.sh if present */
-    run_init_hook_if_present();
-
-    /* mount tmpfs for /tmp and /run (after init.sh, before signaling ready) */
+    /* mount tmpfs for /tmp and /run before /init.sh so services started from
+     * the init hook see the final runtime filesystem layout. */
     require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
     require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
     if (ca->read_only)
         require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+
+    /* run /init.sh if present */
+    run_init_hook_if_present();
 
     /* apply security sandbox (unless privileged) */
     if (!ca->privileged) {

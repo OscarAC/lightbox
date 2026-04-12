@@ -212,7 +212,7 @@ All security features are on by default. Pass `--privileged` to disable.
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
-- **Init**: `sleep infinity` as PID 1 inside the container
+- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted, then lightbox stays alive to reap children and handle shutdown
 - **External tools**: `ip` and `iptables` for networking (fork+exec); everything else is direct syscalls
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 
